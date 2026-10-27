@@ -1,0 +1,50 @@
+#!/bin/bash
+# Stub `claude` for the hermetic tests. The /bin/bash shebang (not env) makes
+# the kernel name this process "claude", like the real CLI.
+#
+# Every run appends one JSON line to $FAKE_CLAUDE_LOG: pid, cwd, argv and the
+# environment names FM_*, GIT_CONFIG_*, CLAUDE_*, COMPACT_ADVISER_DISABLE,
+# LAVISH_AXI_HOST and DISABLE_AUTOUPDATER with their values.
+# When $FAKE_CLAUDE_HOOK names a hook, it is run like Claude's SessionStart
+# hook: event JSON on stdin with session_id (the --resume or --session-id
+# value, else $FAKE_CLAUDE_SESSION_ID, else a fresh id), cwd, source
+# (resume when --resume was given, else startup) and transcript_path.
+# Like Claude Code, it gives the hook and any child CLAUDECODE=1.
+# $FAKE_CLAUDE_CHILD=1 makes it run one nested `claude -p` first, which runs
+# the hook too. Then it stays alive $FAKE_CLAUDE_SLEEP seconds (default 0).
+set -u
+sid=${FAKE_CLAUDE_SESSION_ID:-}
+source=startup
+prev=''
+for a in "$@"; do
+  case "$prev" in --resume|-r) sid=$a; source=resume ;; --session-id) sid=$a ;; esac
+  prev=$a
+done
+[ -n "$sid" ] || sid=$(cat /proc/sys/kernel/random/uuid)
+
+if [ -n "${FAKE_CLAUDE_LOG:-}" ]; then
+  jq -cn --argjson pid $$ --arg cwd "$PWD" '{pid: $pid, cwd: $cwd, argv: $ARGS.positional,
+    env: (env | with_entries(select(.key | test("^(FM_|GIT_CONFIG_|CLAUDE_|COMPACT_ADVISER_DISABLE$|LAVISH_AXI_HOST$|DISABLE_AUTOUPDATER$)"))))}' \
+    --args -- "$@" >>"$FAKE_CLAUDE_LOG"
+fi
+
+if [ "${FAKE_CLAUDE_CHILD:-0}" = 1 ]; then
+  CLAUDECODE=1 FAKE_CLAUDE_CHILD=0 FAKE_CLAUDE_SLEEP=0 FAKE_CLAUDE_SESSION_ID=$(cat /proc/sys/kernel/random/uuid) \
+    "${BASH_SOURCE[0]}" -p "child prompt"
+fi
+
+if [ -n "${FAKE_CLAUDE_HOOK:-}" ]; then
+  jq -cn --arg sid "$sid" --arg cwd "$PWD" --arg source "$source" \
+    --arg tp "${FAKE_CLAUDE_TRANSCRIPT:-$PWD/$sid.jsonl}" \
+    '{session_id: $sid, cwd: $cwd, source: $source, transcript_path: $tp, hook_event_name: "SessionStart"}' |
+    CLAUDECODE=1 "$FAKE_CLAUDE_HOOK"
+  printf '%s\n' "$?" >>"${FAKE_CLAUDE_HOOK_RC:-/dev/null}"
+fi
+
+if [ "${FAKE_CLAUDE_SLEEP:-0}" != 0 ]; then
+  trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM INT
+  sleep "$FAKE_CLAUDE_SLEEP" &
+  sleeper=$!
+  wait "$sleeper"
+fi
+exit 0

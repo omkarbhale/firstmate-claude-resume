@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Stub `herdr` for the hermetic tests: just enough of the 0.9 socket CLI, with
+# its JSON shapes, over a state file in $FAKE_HERDR_DIR.
+#
+#   state.json   {"next": N, "workspaces": {id: {label}}, "tabs": {id: {ws, label}},
+#                 "panes": {id: {ws, tab, cwd, fg: [process names]}}}
+#   calls.log    every invocation, one line, arguments separated by " | "
+#   down         when present, status reports the server as not running
+#   fail-run     when present, `pane run` fails
+#
+# Every call must carry `--session $FAKE_HERDR_SESSION`, or it fails with
+# error code session_mismatch. `pane run` really runs the command (detached)
+# in the pane's cwd, so a stub claude it launches shows up in /proc.
+# jq filters are single-quoted on purpose throughout.
+# shellcheck disable=SC2016
+set -u
+dir=${FAKE_HERDR_DIR:?FAKE_HERDR_DIR is required}
+state="$dir/state.json"
+[ -f "$state" ] || printf '{"next":100,"workspaces":{},"tabs":{},"panes":{}}\n' >"$state"
+
+line=''
+for a in "$@"; do line+="${line:+ | }$a"; done
+printf '%s\n' "$line" >>"$dir/calls.log"
+
+session=''
+args=()
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --session ]; then session=${2:-}; shift 2; continue; fi
+  args+=("$1")
+  shift
+done
+set -- "${args[@]}"
+
+err() {  # <code> <message>
+  jq -cn --arg c "$1" --arg m "$2" '{error: {code: $c, message: $m}, id: "cli"}'
+  exit 1
+}
+save() {  # <jq filter> [args...]
+  local filter=$1 tmp="$state.tmp.$$"
+  shift
+  jq "$@" "$filter" "$state" >"$tmp" && mv -f "$tmp" "$state"
+}
+pane_json() {  # <pane-id>
+  jq -c --arg p "$1" '.panes[$p] as $x | {pane_id: $p, workspace_id: $x.ws, tab_id: $x.tab, cwd: $x.cwd,
+    foreground_cwd: $x.cwd, agent_status: "unknown", focused: false}' "$state"
+}
+
+if [ "${1:-}" = status ]; then
+  if [ -e "$dir/down" ]; then
+    jq -cn --arg s "$session" '{server: {status: "not_running", running: false, session: $s}}'
+  else
+    jq -cn --arg s "$session" '{server: {status: "running", running: true, session: $s}}'
+  fi
+  exit 0
+fi
+[ "$session" = "${FAKE_HERDR_SESSION:-}" ] || err session_mismatch "expected --session ${FAKE_HERDR_SESSION:-}, got '$session'"
+[ ! -e "$dir/down" ] || err server_not_running "server not running"
+
+case "${1:-} ${2:-}" in
+  "pane get")
+    jq -e --arg p "$3" '.panes[$p]' "$state" >/dev/null || err pane_not_found "pane $3 not found"
+    jq -cn --argjson pane "$(pane_json "$3")" '{id: "cli:pane:get", result: {type: "pane_info", pane: $pane}}'
+    ;;
+  "pane process-info")
+    [ "$3" = --pane ] || err bad_args "process-info needs --pane"
+    jq -e --arg p "$4" '.panes[$p]' "$state" >/dev/null || err pane_not_found "pane $4 not found"
+    jq -c --arg p "$4" '{id: "cli:pane:process_info", result: {type: "pane_process_info", process_info: {
+      pane_id: $p, shell_pid: 4242, foreground_process_group_id: 4242,
+      foreground_processes: [.panes[$p].fg[] | {name: ., argv: [.], pid: 4242}]}}}' "$state"
+    ;;
+  "pane run")
+    jq -e --arg p "$3" '.panes[$p]' "$state" >/dev/null || err pane_not_found "pane $3 not found"
+    [ ! -e "$dir/fail-run" ] || err run_failed "pane run failed"
+    cwd=$(jq -r --arg p "$3" '.panes[$p].cwd' "$state")
+    printf '%s\t%s\n' "$3" "$4" >>"$dir/runs.log"
+    (cd "$cwd" 2>/dev/null || cd /; HERDR_PANE_ID=$3 setsid bash -c "$4" </dev/null >>"$dir/run-output.log" 2>&1 &)
+    save '.panes[$p].fg = ["claude"]' --arg p "$3"
+    jq -cn '{id: "cli:pane:run", result: {type: "ok"}}'
+    ;;
+  "workspace get")
+    jq -e --arg w "$3" '.workspaces[$w]' "$state" >/dev/null || err workspace_not_found "workspace $3 not found"
+    jq -c --arg w "$3" '{id: "cli:workspace:get", result: {type: "workspace_info",
+      workspace: {workspace_id: $w, label: .workspaces[$w].label}}}' "$state"
+    ;;
+  "workspace create")
+    shift 2
+    cwd='' label=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in --cwd) cwd=$2; shift 2 ;; --label) label=$2; shift 2 ;; *) shift ;; esac
+    done
+    n=$(jq -r .next "$state")
+    ws="w$n" tab="w$n:t1" pane="w$n:p1"
+    save '.next += 1 | .workspaces[$w] = {label: $l} | .tabs[$t] = {ws: $w, label: "1"}
+      | .panes[$p] = {ws: $w, tab: $t, cwd: $c, fg: ["bash"]}' \
+      --arg w "$ws" --arg t "$tab" --arg p "$pane" --arg l "$label" --arg c "$cwd"
+    jq -cn --arg w "$ws" --arg t "$tab" --arg l "$label" --argjson pane "$(pane_json "$pane")" \
+      '{id: "cli:workspace:create", result: {type: "workspace_created",
+        workspace: {workspace_id: $w, label: $l}, tab: {tab_id: $t, workspace_id: $w, label: "1"}, root_pane: $pane}}'
+    ;;
+  "tab create")
+    shift 2
+    ws='' cwd='' label=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in --workspace) ws=$2; shift 2 ;; --cwd) cwd=$2; shift 2 ;; --label) label=$2; shift 2 ;; *) shift ;; esac
+    done
+    jq -e --arg w "$ws" '.workspaces[$w]' "$state" >/dev/null || err workspace_not_found "workspace $ws not found"
+    n=$(jq -r .next "$state")
+    tab="$ws:t$n" pane="$ws:p$n"
+    save '.next += 1 | .tabs[$t] = {ws: $w, label: $l} | .panes[$p] = {ws: $w, tab: $t, cwd: $c, fg: ["bash"]}' \
+      --arg w "$ws" --arg t "$tab" --arg p "$pane" --arg l "$label" --arg c "$cwd"
+    jq -cn --arg w "$ws" --arg t "$tab" --arg l "$label" --argjson pane "$(pane_json "$pane")" \
+      '{id: "cli:tab:create", result: {type: "tab_created", tab: {tab_id: $t, workspace_id: $w, label: $l}, root_pane: $pane}}'
+    ;;
+  "tab rename")
+    jq -e --arg t "$3" '.tabs[$t]' "$state" >/dev/null || err tab_not_found "tab $3 not found"
+    save '.tabs[$t].label = $l' --arg t "$3" --arg l "$4"
+    jq -cn '{id: "cli:tab:rename", result: {type: "ok"}}'
+    ;;
+  *)
+    err unsupported "stub herdr does not implement: $*"
+    ;;
+esac

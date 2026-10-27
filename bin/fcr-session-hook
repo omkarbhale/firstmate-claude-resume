@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# fcr-session-hook - firstmate-claude-resume's Claude Code SessionStart hook.
+# It records the exact session id of every firstmate Claude session, next to
+# that task's firstmate record, so `fcr resume` can bring it back after a
+# reboot or a Herdr restart.
+#
+# Installed by install.sh as ONE SessionStart entry in <config dir>/settings.json.
+# Claude runs it on every startup, resume, clear and compact event, with the
+# event JSON (session_id, cwd, source, transcript_path) on stdin.
+#
+# Where it writes:
+#   - FM_TASK_INBOX=<home>/state/<task-id>.inbox set: <home>/state/<task-id>.claude-session
+#   - otherwise, cwd is a firstmate home root (bin/fm-lock.sh and bin/fm-spawn.sh
+#     present): <home>/state/.primary-claude-session
+#   - otherwise: nothing (not a firstmate session).
+# The record is one JSON object (format version 1) written atomically (temp
+# file plus rename), so it always names the current session id.
+#
+# What it records: the session id, cwd, source event, transcript path, the
+# Herdr session/workspace/tab/pane from the HERDR_* variables, a capture time,
+# the exact launch argv of the owning `claude` process (read from /proc by
+# walking this hook's ancestry, never reconstructed), an allowlisted slice of
+# that process's launch environment (FCR_ENV_ALLOW below; names that look like
+# credentials are dropped even when allowlisted, FCR_ENV_DENY), and
+# previous_sessions: the last 10 ids the record named before, newest first.
+#
+# It skips `--print` sessions and nested Claude processes, so a child can never
+# overwrite its parent task's record. A nested claude is one whose own launch
+# environment has CLAUDECODE=1, which Claude Code sets for every process it
+# starts (such as a `claude -p` a worker runs). Firstmate's Herdr backend unsets
+# CLAUDECODE when it starts a Herdr server, so worker panes never inherit it;
+# the process tree is not used, because a Herdr server started from inside a
+# Claude session puts every pane under that session.
+#
+# It must never fail or slow a session: no network, no output, exit 0 always.
+# Set FCR_HOOK_DEBUG=<file> to append a one-line reason when it records or skips.
+set -u
+
+FCR_ENV_ALLOW='^(FM_[A-Za-z0-9_]*|GIT_CONFIG_[A-Za-z0-9_]*|COMPACT_ADVISER_DISABLE|LAVISH_AXI_HOST|CLAUDE_CONFIG_DIR|CLAUDE_CODE_[A-Za-z0-9_]*|DISABLE_AUTOUPDATER)$'
+FCR_ENV_DENY='(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|AUTH|COOKIE|^CLAUDE_CODE_(SESSION_ID|MESSAGING_.*|CHILD_SESSION|ENTRYPOINT|EXECPATH|SSE_PORT)$)'
+
+fcr_hook_debug() {
+  [ -n "${FCR_HOOK_DEBUG:-}" ] || return 0
+  printf '%s fcr-session-hook: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$FCR_HOOK_DEBUG" 2>/dev/null || true
+}
+
+# fcr_hook_is_claude <pid>: the process is a Claude Code CLI, by kernel name or
+# argv[0] (a shebang-script claude shows its own name as comm).
+fcr_hook_is_claude() {
+  local pid=$1 comm argv0
+  read -r comm <"/proc/$pid/comm" 2>/dev/null || return 1
+  [ "$comm" = claude ] && return 0
+  IFS= read -r -d '' argv0 <"/proc/$pid/cmdline" 2>/dev/null || [ -n "${argv0:-}" ] || return 1
+  [ "${argv0##*/}" = claude ]
+}
+
+fcr_hook_ppid() {
+  local stat
+  local -a fields
+  read -r stat <"/proc/$1/stat" 2>/dev/null || return 1
+  # Field 2 (comm) may contain spaces and parentheses; everything after the
+  # LAST ")" is well formed: "<state> <ppid> ...".
+  read -r -a fields <<<"${stat##*) }"
+  printf '%s' "${fields[1]:-}"
+}
+
+# fcr_hook_find_claude: print the pid of the nearest `claude` ancestor of this
+# hook, or fail.
+fcr_hook_find_claude() {
+  local pid=$PPID depth=0
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 64 ]; do
+    if fcr_hook_is_claude "$pid"; then
+      printf '%s' "$pid"
+      return 0
+    fi
+    pid=$(fcr_hook_ppid "$pid") || break
+    depth=$((depth + 1))
+  done
+  fcr_hook_debug "skip: no claude ancestor"
+  return 1
+}
+
+fcr_hook_main() {
+  local input='' session_id cwd source transcript inbox state task_id target kind
+  local claude_pid argv_json env_json herdr_session tmp now_iso now_epoch previous
+
+  IFS= read -r -d '' -t 5 input || true
+  [ -n "$input" ] || { fcr_hook_debug "skip: empty stdin"; return 0; }
+  command -v jq >/dev/null 2>&1 || return 0
+
+  session_id=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null) || return 0
+  cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null) || return 0
+  source=$(printf '%s' "$input" | jq -r '.source // empty' 2>/dev/null) || return 0
+  transcript=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null) || return 0
+  [ -n "$session_id" ] || { fcr_hook_debug "skip: no session_id"; return 0; }
+  [ -n "$cwd" ] || cwd=$PWD
+
+  inbox=${FM_TASK_INBOX:-}
+  if [ -n "$inbox" ]; then
+    state=${inbox%/*}
+    task_id=${inbox##*/}
+    task_id=${task_id%.inbox}
+    case "$inbox" in /*.inbox) ;; *) fcr_hook_debug "skip: malformed FM_TASK_INBOX=$inbox"; return 0 ;; esac
+    if [ -z "$task_id" ] || [ ! -d "$state" ]; then fcr_hook_debug "skip: no state dir for $inbox"; return 0; fi
+    target="$state/$task_id.claude-session"
+    kind=task
+  elif [ -f "$cwd/bin/fm-lock.sh" ] && [ -f "$cwd/bin/fm-spawn.sh" ]; then
+    state="$cwd/state"
+    task_id=''
+    if [ ! -d "$state" ]; then
+      (umask 022 && mkdir -p "$state") 2>/dev/null || return 0
+    fi
+    target="$state/.primary-claude-session"
+    kind=primary
+  else
+    fcr_hook_debug "skip: not a firstmate session (cwd=$cwd)"
+    return 0
+  fi
+
+  claude_pid=$(fcr_hook_find_claude) || return 0
+  argv_json=$(jq -Rs '
+    split("\u0000") | if .[-1] == "" then .[:-1] else . end
+    # A shebang-script claude runs as "<interpreter> <path>/claude args...";
+    # record the claude invocation itself.
+    | if (.[0] | split("/") | last) != "claude" and ((.[1] // "") | split("/") | last) == "claude"
+      then .[1:] else . end
+  ' <"/proc/$claude_pid/cmdline" 2>/dev/null) || return 0
+  if printf '%s' "$argv_json" | jq -e 'any(.[]; . == "-p" or . == "--print")' >/dev/null 2>&1; then
+    fcr_hook_debug "skip: --print session $session_id"
+    return 0
+  fi
+  if tr '\0' '\n' <"/proc/$claude_pid/environ" 2>/dev/null | grep -qx 'CLAUDECODE=1'; then
+    fcr_hook_debug "skip: nested claude $claude_pid (CLAUDECODE=1 in its launch environment)"
+    return 0
+  fi
+  env_json=$(jq -Rs --arg allow "$FCR_ENV_ALLOW" --arg deny "$FCR_ENV_DENY" '
+    split("\u0000")
+    | map(select(test("^[A-Za-z_][A-Za-z0-9_]*=")) | capture("^(?<key>[^=]+)=(?<value>.*)$"; "s"))
+    | map(select((.key | test($allow)) and ((.key | test($deny; "i")) | not)))
+    | from_entries
+  ' <"/proc/$claude_pid/environ" 2>/dev/null) || env_json='{}'
+
+  herdr_session=${HERDR_SESSION:-}
+  if [ -z "$herdr_session" ] && [ -n "${HERDR_SOCKET_PATH:-}" ]; then
+    case "$HERDR_SOCKET_PATH" in
+      */sessions/*/herdr.sock)
+        herdr_session=${HERDR_SOCKET_PATH%/herdr.sock}
+        herdr_session=${herdr_session##*/}
+        ;;
+      *) herdr_session=default ;;
+    esac
+  fi
+  [ -n "$herdr_session" ] || [ -z "${HERDR_PANE_ID:-}" ] || herdr_session=default
+
+  # Keep the ids this record named before, newest first, so a session that a
+  # fresh start replaced (say, a primary reopened before `fcr resume` ran) can
+  # still be resumed by hand.
+  previous=$(jq -c --arg sid "$session_id" '
+    (.previous_sessions // []) as $p
+    | if .session_id != $sid
+      then [{session_id, captured_at, source, transcript_path}] + $p else $p end
+    | map(select(.session_id != $sid)) | .[:10]' "$target" 2>/dev/null) || previous='[]'
+  printf '%s' "$previous" | jq -e 'type == "array"' >/dev/null 2>&1 || previous='[]'
+
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  now_epoch=$(date +%s)
+  tmp="$state/.${target##*/}.tmp.$$"
+  (
+    umask 077
+    jq -n \
+      --arg kind "$kind" --arg task_id "$task_id" --arg state_dir "$state" \
+      --arg session_id "$session_id" --arg source "$source" --arg cwd "$cwd" \
+      --arg transcript "$transcript" --arg captured_at "$now_iso" --argjson captured_epoch "$now_epoch" \
+      --arg hs "$herdr_session" --arg hw "${HERDR_WORKSPACE_ID:-}" \
+      --arg ht "${HERDR_TAB_ID:-}" --arg hp "${HERDR_PANE_ID:-}" \
+      --argjson claude_pid "$claude_pid" --argjson argv "$argv_json" --argjson env "$env_json" \
+      --argjson previous "$previous" '
+      {
+        format: 1, kind: $kind, task_id: $task_id, state_dir: $state_dir,
+        session_id: $session_id, source: $source, cwd: $cwd, transcript_path: $transcript,
+        captured_at: $captured_at, captured_epoch: $captured_epoch,
+        herdr: {session: $hs, workspace_id: $hw, tab_id: $ht, pane_id: $hp},
+        claude_pid: $claude_pid, argv: $argv, env: $env, previous_sessions: $previous
+      }' >"$tmp"
+  ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; fcr_hook_debug "error: could not write $tmp"; return 0; }
+  mv -f "$tmp" "$target" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; fcr_hook_debug "error: could not write $target"; return 0; }
+  fcr_hook_debug "recorded $kind ${task_id:-primary} session=$session_id source=$source -> $target"
+}
+
+fcr_hook_main >/dev/null 2>&1 || true
+exit 0

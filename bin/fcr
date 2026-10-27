@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+# fcr - firstmate-claude-resume: bring firstmate's Claude sessions back after a
+# reboot or a Herdr restart, each in its own exact session, folder and pane.
+#
+# Usage:
+#   fcr resume [--home <dir>] [--only <task-id>|primary] [--dry-run] [--verbose]
+#   fcr version
+#   fcr help
+#
+# `fcr resume` walks a firstmate home (default ~/firstmate) and every second
+# mate home it records, recursively, and for each Claude task with a session
+# record written by fcr-session-hook decides one of:
+#   alive      a live `claude` process already runs that session id or task
+#              (firstmate relaunched it, or it never died) - left alone
+#   resume     resumed with `claude --resume <id>` in its recorded cwd, with its
+#              recorded argv and environment and a short restart note
+#   skip       not resumable, with the reason
+# Order: second mates first, each followed by its own tasks, then the home's
+# other tasks, and the primary firstmate session last. The primary is included
+# only when `<home>/bin/fm-lock.sh status` reports no live owner.
+#
+# Placement: the task's recorded Herdr pane is reused when it still exists and
+# holds only a shell. Otherwise a new tab labeled fm-<task-id> is created in the
+# recorded workspace, or a new workspace when that is gone too (labeled
+# fm-<task-id>, 2ndmate-<id> for a second mate, firstmate for the primary
+# only), and ONLY window, herdr_workspace_id,
+# herdr_tab_id and herdr_pane_id are rewritten in the task's meta (temp file
+# plus rename). Every Herdr call passes the recorded --session explicitly.
+#
+# Options:
+#   --home <dir>     firstmate home to walk (default: $FCR_HOME or ~/firstmate)
+#   --only <id>      act on one task id (any depth), or `primary`
+#   --dry-run        print the plan; change nothing (Herdr is only read)
+#   --verbose        also print each resume command line
+#
+# Environment:
+#   FCR_HERDR          herdr executable (default: herdr)
+#   FCR_HERDR_WAIT     seconds to wait for each Herdr session to answer (default 30)
+#   FCR_LAUNCH_WAIT    seconds to wait for a resumed claude to appear (default 20)
+#   FCR_STATE_DIR      where launcher scripts are written
+#                      (default: ${XDG_STATE_HOME:-~/.local/state}/firstmate-claude-resume)
+#
+# Exit status: 0 when every resumable task is alive or resumed, 1 when any
+# resumable task failed to resume, 2 on usage errors or when Herdr never answers.
+set -u
+
+FCR_VERSION=1.0.0
+FCR_SHELLS='bash zsh sh dash fish ksh mksh tcsh csh nu'
+
+fcr_die() {
+  printf 'fcr: %s\n' "$*" >&2
+  exit 2
+}
+
+fcr_usage() {
+  sed -n '5,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+fcr_help() {
+  sed -n '2,/^set -u$/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
+}
+
+fcr_herdr() {  # <session> <herdr args...>; the session is always explicit
+  local session=$1
+  shift
+  "${FCR_HERDR:-herdr}" "$@" --session "$session"
+}
+
+# --- record and meta reading -------------------------------------------------
+
+fcr_meta_get() {  # <meta> <key>
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1
+}
+
+# fcr_meta_set_placement <meta> <session> <workspace> <tab> <pane>: rewrite only
+# the four placement keys, keeping every other line and its order.
+fcr_meta_set_placement() {
+  local meta=$1 session=$2 ws=$3 tab=$4 pane=$5 tmp
+  tmp="${meta%/*}/.${meta##*/}.fcr.$$"
+  awk -v window="$session:$pane" -v ws="$ws" -v tab="$tab" -v pane="$pane" '
+    BEGIN { want["window"] = window; want["herdr_workspace_id"] = ws
+            want["herdr_tab_id"] = tab; want["herdr_pane_id"] = pane }
+    {
+      k = $0; sub(/=.*/, "", k)
+      if ((k in want) && index($0, "=") > 0) {
+        if (!(k in done)) { print k "=" want[k]; done[k] = 1 }
+        next
+      }
+      print
+    }
+    END {
+      n = split("window herdr_workspace_id herdr_tab_id herdr_pane_id", order, " ")
+      for (i = 1; i <= n; i++) if (!(order[i] in done)) print order[i] "=" want[order[i]]
+    }
+  ' "$meta" >"$tmp" 2>/dev/null && mv -f "$tmp" "$meta" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# --- argv rewriting ----------------------------------------------------------
+
+# Claude options that always take a value (commander `<value>`).
+FCR_OPT_VALUE=' --agent --agents --append-system-prompt --append-system-prompt-file --autocompact --debug-file --effort --environment --fallback-model --input-format --json-schema --max-budget-usd --max-turns --max-thinking-tokens --model -n --name --output-format --permission-mode --permission-prompts --permission-prompt-tool --plugin-dir --plugin-url --remote-control-session-name-prefix --session-id --setting-sources --settings --system-prompt --system-prompt-file --system-prompt-snapshot --resume-session-at '
+# Options whose value is optional (commander `[value]`): they consume the next
+# token only when it does not start with "-".
+FCR_OPT_OPTIONAL=' -r --resume -d --debug --cloud --from-pr --prompt-suggestions --remote-control --teleport -w --worktree '
+# Variadic options (commander `<values...>`): they consume every following
+# token up to the next one starting with "-".
+FCR_OPT_VARIADIC=' --add-dir --allowedTools --allowed-tools --disallowedTools --disallowed-tools --betas --file --mcp-config --tools '
+# Options dropped on resume, with their values: the old session selection.
+FCR_OPT_DROP=' -r --resume -c --continue --session-id --fork-session '
+
+# fcr_rewrite_argv <id> <note> <argv...>: print the resume argv, one element per
+# NUL. Keeps the executable (and a node/script prefix when present) and every
+# option with its values; drops prompt positionals, everything after "--", and
+# any --resume/--session-id/--continue/--fork-session; then appends
+# `--resume <id> <note>`.
+fcr_rewrite_argv() {
+  local id=$1 note=$2 i n tok name has_eq drop
+  shift 2
+  local -a in=("$@") out=()
+  n=${#in[@]}
+  [ "$n" -gt 0 ] || return 1
+  i=0
+  # The executable itself, plus "<interpreter> <claude script>" prefixes.
+  case "${in[0]##*/}" in
+    claude) out+=("${in[0]}"); i=1 ;;
+    *)
+      while [ "$i" -lt "$n" ]; do
+        out+=("${in[i]}")
+        case "${in[i]##*/}" in claude | cli.js | cli.mjs | cli.cjs) i=$((i + 1)); break ;; esac
+        i=$((i + 1))
+      done
+      ;;
+  esac
+  while [ "$i" -lt "$n" ]; do
+    tok=${in[i]}
+    if [ "$tok" = -- ]; then
+      break
+    fi
+    case "$tok" in
+      -?*)
+        name=${tok%%=*}
+        has_eq=0
+        [ "$name" = "$tok" ] || has_eq=1
+        drop=0
+        case "$FCR_OPT_DROP" in *" $name "*) drop=1 ;; esac
+        [ "$drop" = 1 ] || out+=("$tok")
+        i=$((i + 1))
+        [ "$has_eq" = 0 ] || continue
+        case "$FCR_OPT_VALUE" in
+          *" $name "*)
+            if [ "$i" -lt "$n" ]; then
+              [ "$drop" = 1 ] || out+=("${in[i]}")
+              i=$((i + 1))
+            fi
+            continue
+            ;;
+        esac
+        case "$FCR_OPT_OPTIONAL" in
+          *" $name "*)
+            if [ "$i" -lt "$n" ] && [ "${in[i]#-}" = "${in[i]}" ]; then
+              [ "$drop" = 1 ] || out+=("${in[i]}")
+              i=$((i + 1))
+            fi
+            continue
+            ;;
+        esac
+        case "$FCR_OPT_VARIADIC" in
+          *" $name "*)
+            while [ "$i" -lt "$n" ] && [ "${in[i]#-}" = "${in[i]}" ]; do
+              out+=("${in[i]}")
+              i=$((i + 1))
+            done
+            ;;
+        esac
+        ;;
+      *)
+        # A positional: the original prompt (or part of it). Dropped.
+        i=$((i + 1))
+        ;;
+    esac
+  done
+  out+=(--resume "$id" "$note")
+  printf '%s\0' "${out[@]}"
+}
+
+fcr_restart_note() {  # <session-id>
+  printf '%s' "[firstmate-claude-resume] The machine or the Herdr multiplexer restarted. This is the same Claude session ($1) resumed with its conversation intact, in its original folder and with its original settings. Everything that ran in the background did not survive the restart: background shell jobs, monitors, Workflows, subagents and any child processes you started are gone. Check what you had running and resume or restart it (resume an interrupted Workflow with resumeFromRunId), then carry on with your task."
+}
+
+# --- liveness ----------------------------------------------------------------
+
+# fcr_live_claude_scan: print one line per live interactive claude process
+# owned by this user: "<pid>\t<FM_TASK_INBOX or ->\t<cwd>\t<session ids named
+# in argv>". One-shot `claude -p` helpers (firstmate's supervision host runs
+# them inside a task's environment) never count as the task's agent.
+fcr_live_claude_scan() {
+  local d pid comm argv0 inbox cwd ids uid
+  uid=$(id -u)
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ -O "$d" ] || [ "$uid" = 0 ] || continue
+    read -r comm <"$d/comm" 2>/dev/null || continue
+    argv0=''
+    IFS= read -r -d '' argv0 <"$d/cmdline" 2>/dev/null || true
+    [ "$comm" = claude ] || [ "${argv0##*/}" = claude ] || continue
+    tr '\0' '\n' <"$d/cmdline" 2>/dev/null | grep -qx -e '-p' -e '--print' && continue
+    inbox=$(tr '\0' '\n' <"$d/environ" 2>/dev/null | sed -n 's/^FM_TASK_INBOX=//p' | head -n 1)
+    cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=''
+    ids=$(tr '\0' '\n' <"$d/cmdline" 2>/dev/null | awk '
+      prev == "--resume" || prev == "-r" || prev == "--session-id" { print }
+      /^--(resume|session-id)=/ { sub(/^[^=]*=/, ""); print }
+      { prev = $0 }' | tr '\n' ' ')
+    printf '%s\t%s\t%s\t%s\n' "$pid" "${inbox:--}" "$cwd" "$ids"
+  done
+}
+
+# fcr_alive_pid <inbox-or-empty> <session-id>: print the pid of a live claude
+# serving that task or session, or fail.
+fcr_alive_pid() {
+  local inbox=$1 sid=$2 pid pinbox cwd ids
+  while IFS=$'\t' read -r pid pinbox cwd ids; do
+    if [ -n "$inbox" ] && [ "$pinbox" = "$inbox" ]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+    case " $ids " in *" $sid "*) printf '%s' "$pid"; return 0 ;; esac
+  done < <(fcr_live_claude_scan)
+  return 1
+}
+
+# --- Herdr ---------------------------------------------------------------------
+
+# fcr_herdr_wait <session>: wait up to FCR_HERDR_WAIT seconds for the session's
+# server to report running.
+fcr_herdr_wait() {
+  local session=$1 deadline running
+  deadline=$(($(date +%s) + ${FCR_HERDR_WAIT:-30}))
+  while :; do
+    running=$(fcr_herdr "$session" status --json 2>/dev/null | jq -r '.server.running // false' 2>/dev/null)
+    [ "$running" = true ] && return 0
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+# fcr_pane_state <session> <pane>: present|gone|unknown
+fcr_pane_state() {
+  local out code got
+  [ -n "$2" ] || { printf 'gone'; return 0; }
+  out=$(fcr_herdr "$1" pane get "$2" 2>&1)
+  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  if [ -n "$code" ]; then
+    [ "$code" = pane_not_found ] && printf 'gone' || printf 'unknown'
+    return 0
+  fi
+  got=$(printf '%s' "$out" | jq -r '.result.pane.pane_id // empty' 2>/dev/null)
+  [ "$got" = "$2" ] && printf 'present' || printf 'unknown'
+}
+
+# fcr_pane_tab <session> <pane>: the pane's current tab and workspace, "<ws> <tab>".
+fcr_pane_tab() {
+  fcr_herdr "$1" pane get "$2" 2>/dev/null |
+    jq -r '.result.pane | "\(.workspace_id // "") \(.tab_id // "")"' 2>/dev/null
+}
+
+# fcr_pane_idle <session> <pane>: succeed when every foreground process in the
+# pane is a shell. Resampled briefly, because a shell's prompt helpers show up
+# in the foreground group for a moment.
+fcr_pane_idle() {
+  local attempt=0 info names name ok
+  while [ "$attempt" -lt 10 ]; do
+    info=$(fcr_herdr "$1" pane process-info --pane "$2" 2>/dev/null)
+    names=$(printf '%s' "$info" | jq -r --arg pane "$2" '
+      select(.result.process_info.pane_id == $pane)
+      | .result.process_info.foreground_processes[]?
+      | (.name // ((.argv // [""])[0] | split("/") | last))' 2>/dev/null)
+    if [ -n "$names" ]; then
+      ok=1
+      while IFS= read -r name; do
+        name=${name#-}
+        case " $FCR_SHELLS " in *" $name "*) ;; *) ok=0 ;; esac
+      done <<<"$names"
+      [ "$ok" = 1 ] && return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
+  return 1
+}
+
+fcr_workspace_exists() {  # <session> <workspace>
+  [ -n "$2" ] || return 1
+  fcr_herdr "$1" workspace get "$2" 2>/dev/null |
+    jq -e --arg ws "$2" '.result.workspace.workspace_id == $ws' >/dev/null 2>&1
+}
+
+# --- planning ------------------------------------------------------------------
+
+# Parallel arrays, one entry per task, in resume order.
+T_LABEL=() T_KIND=() T_META=() T_RECORD=() T_INBOX=() T_HOME=()
+
+fcr_add_task() {  # <label> <kind> <meta> <record> <inbox> <home>
+  T_LABEL+=("$1") T_KIND+=("$2") T_META+=("$3") T_RECORD+=("$4") T_INBOX+=("$5") T_HOME+=("$6")
+}
+
+# fcr_walk_home <home> <label-prefix>: second mates first (each followed by its
+# own home), then the other tasks.
+fcr_walk_home() {
+  local home=$1 prefix=$2 state meta id kind harness smhome real
+  real=$(cd "$home" 2>/dev/null && pwd -P) || return 0
+  case " ${FCR_VISITED:-} " in *" $real "*) return 0 ;; esac
+  FCR_VISITED="${FCR_VISITED:-} $real"
+  state="$home/state"
+  [ -d "$state" ] || return 0
+  local -a secondmates=() others=()
+  for meta in "$state"/*.meta; do
+    [ -f "$meta" ] || continue
+    kind=$(fcr_meta_get "$meta" kind)
+    if [ "$kind" = secondmate ]; then secondmates+=("$meta"); else others+=("$meta"); fi
+  done
+  for meta in ${secondmates[@]+"${secondmates[@]}"} ${others[@]+"${others[@]}"}; do
+    id=${meta##*/}
+    id=${id%.meta}
+    harness=$(fcr_meta_get "$meta" harness)
+    kind=$(fcr_meta_get "$meta" kind)
+    if [ "$harness" = claude ]; then
+      fcr_add_task "$prefix$id" "${kind:-task}" "$meta" "$state/$id.claude-session" "$state/$id.inbox" "$home"
+    else
+      fcr_add_task "$prefix$id" "${kind:-task}" "$meta" "" "" "$home"
+    fi
+    if [ "$kind" = secondmate ]; then
+      smhome=$(fcr_meta_get "$meta" home)
+      [ -z "$smhome" ] || fcr_walk_home "$smhome" "$prefix$id/"
+    fi
+  done
+}
+
+fcr_lock_status() {  # <home>
+  local home=$1
+  [ -x "$home/bin/fm-lock.sh" ] || { printf 'unknown (no bin/fm-lock.sh)'; return 0; }
+  env -u FM_ROOT_OVERRIDE -u FM_STATE_OVERRIDE -u FM_DATA_OVERRIDE -u FM_PROJECTS_OVERRIDE \
+    -u FM_CONFIG_OVERRIDE -u FM_TASK_INBOX FM_HOME="$home" "$home/bin/fm-lock.sh" status 2>/dev/null | head -n 1
+}
+
+fcr_shell_join() {  # <args...>: one shell-quoted command line
+  local out='' a
+  for a in "$@"; do out+=" $(printf '%q' "$a")"; done
+  printf '%s' "${out# }"
+}
+
+# fcr_write_launcher <file> <cwd> <env-json> <argv...>
+fcr_write_launcher() {
+  local file=$1 cwd=$2 env_json=$3 tmp
+  shift 3
+  tmp="$file.tmp.$$"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# Written by fcr resume %s at %s. Safe to delete.\n' "$FCR_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'cd -- %q || exit 1\n' "$cwd"
+    # Start from a clean slate for every allowlisted name, so a value the pane
+    # shell inherited cannot stand in for one the session never had.
+    # shellcheck disable=SC2016 # Expanded by the launcher, not here.
+    printf 'while IFS= read -r fcr_v; do unset "$fcr_v"; done < <(compgen -e | grep -E %q)\n' \
+      '^(FM_[A-Za-z0-9_]*|GIT_CONFIG_[A-Za-z0-9_]*|COMPACT_ADVISER_DISABLE|LAVISH_AXI_HOST|CLAUDE_CONFIG_DIR|CLAUDE_CODE_[A-Za-z0-9_]*|DISABLE_AUTOUPDATER|CLAUDECODE)$'
+    printf 'unset fcr_v\n'
+    printf '%s' "$env_json" | jq -r 'to_entries[] | "export \(.key)=\(.value | @sh)"'
+    printf 'exec %s\n' "$(fcr_shell_join "$@")"
+  } >"$tmp" && chmod 700 "$tmp" && mv -f "$tmp" "$file" && return 0
+  rm -f "$tmp"
+  return 1
+}
+
+fcr_wait_launched() {  # <inbox-or-empty> <session-id>
+  local deadline
+  deadline=$(($(date +%s) + ${FCR_LAUNCH_WAIT:-20}))
+  while :; do
+    fcr_alive_pid "$1" "$2" >/dev/null && return 0
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 0.5
+  done
+}
+
+fcr_say() {  # <outcome> <label> <detail>
+  printf '%-13s %-28s %s\n' "$1" "$2" "$3"
+}
+
+# --- resume ----------------------------------------------------------------------
+
+fcr_resume() {
+  local home=${FCR_HOME:-$HOME/firstmate} only='' dry=0 verbose=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --home) [ "$#" -ge 2 ] || fcr_die "--home needs a directory"; home=$2; shift 2 ;;
+      --home=*) home=${1#*=}; shift ;;
+      --only) [ "$#" -ge 2 ] || fcr_die "--only needs a task id"; only=$2; shift 2 ;;
+      --only=*) only=${1#*=}; shift ;;
+      --dry-run|-n) dry=1; shift ;;
+      --verbose|-v) verbose=1; shift ;;
+      -h|--help) fcr_help; return 0 ;;
+      *) fcr_usage >&2; fcr_die "unknown argument: $1" ;;
+    esac
+  done
+  command -v jq >/dev/null 2>&1 || fcr_die "jq is required"
+  [ -d "$home" ] || fcr_die "firstmate home not found: $home"
+  home=$(cd "$home" && pwd -P)
+  [ -d "$home/state" ] || fcr_die "not a firstmate home (no state/): $home"
+
+  T_LABEL=() T_KIND=() T_META=() T_RECORD=() T_INBOX=() T_HOME=()
+  FCR_VISITED=''
+  fcr_walk_home "$home" ''
+  if [ -f "$home/state/.primary-claude-session" ]; then
+    fcr_add_task primary primary "" "$home/state/.primary-claude-session" "" "$home"
+  fi
+
+  local n=${#T_LABEL[@]} i label kind meta record inbox rec sid cwd transcript session
+  local pid lock reason ws tab pane state place newws newtab newpane out note launcher
+  local launch_dir failed=0 resumed=0 alive=0 skipped=0 matched=0
+  local -a plan_idx=() sessions=() argv=() newargv=()
+  launch_dir=${FCR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate-claude-resume}/launch
+
+  [ "$dry" = 0 ] || printf 'fcr resume --dry-run: nothing will be changed\n'
+  printf 'home: %s\n' "$home"
+
+  # Pass 1: classify without touching anything.
+  for ((i = 0; i < n; i++)); do
+    label=${T_LABEL[i]} kind=${T_KIND[i]} meta=${T_META[i]} record=${T_RECORD[i]} inbox=${T_INBOX[i]}
+    if [ -n "$only" ] && [ "$only" != "$label" ] && [ "$only" != "${label##*/}" ]; then
+      continue
+    fi
+    matched=$((matched + 1))
+    if [ -z "$record" ]; then
+      fcr_say skip "$label" "harness $(fcr_meta_get "$meta" harness) (Claude only)"
+      skipped=$((skipped + 1)); continue
+    fi
+    if [ ! -f "$record" ]; then
+      fcr_say skip "$label" "no session record (started before fcr was installed?)"
+      skipped=$((skipped + 1)); continue
+    fi
+    rec=$(jq -c 'select(.format == 1)' "$record" 2>/dev/null)
+    sid=$(printf '%s' "$rec" | jq -r '.session_id // empty' 2>/dev/null)
+    if [ -z "$sid" ]; then
+      fcr_say skip "$label" "unreadable session record $record"
+      skipped=$((skipped + 1)); continue
+    fi
+    if [ "$kind" = primary ]; then
+      lock=$(fcr_lock_status "${T_HOME[i]}")
+      case "$lock" in
+        "lock: held"*)
+          fcr_say alive "$label" "firstmate lock ${lock#lock: }"
+          alive=$((alive + 1)); continue ;;
+      esac
+    fi
+    if pid=$(fcr_alive_pid "$inbox" "$sid"); then
+      fcr_say alive "$label" "claude pid $pid already running (session $sid)"
+      alive=$((alive + 1)); continue
+    fi
+    cwd=$(printf '%s' "$rec" | jq -r '.cwd // empty')
+    transcript=$(printf '%s' "$rec" | jq -r '.transcript_path // empty')
+    reason=''
+    if [ -n "$meta" ] && [ "$(fcr_meta_get "$meta" backend)" != herdr ]; then
+      reason="backend '$(fcr_meta_get "$meta" backend)' is not herdr (Herdr only)"
+    elif [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+      reason="recorded folder is gone: ${cwd:-<none>}"
+    elif [ -n "$transcript" ] && [ ! -f "$transcript" ]; then
+      reason="transcript is gone: $transcript"
+    elif ! printf '%s' "$rec" | jq -e '(.argv | type) == "array" and (.argv | length) > 0' >/dev/null 2>&1; then
+      reason="session record has no launch argv"
+    fi
+    session=''
+    [ -z "$meta" ] || session=$(fcr_meta_get "$meta" herdr_session)
+    [ -n "$session" ] || session=$(printf '%s' "$rec" | jq -r '.herdr.session // empty')
+    if [ -z "$reason" ] && [ -z "$session" ]; then
+      reason="no Herdr session recorded (run: cd $(printf '%q' "$cwd") && claude --resume $sid)"
+    fi
+    if [ -n "$reason" ]; then
+      fcr_say skip "$label" "$reason"
+      skipped=$((skipped + 1)); continue
+    fi
+    plan_idx+=("$i")
+    case " ${sessions[*]+${sessions[*]}} " in *" $session "*) ;; *) sessions+=("$session") ;; esac
+  done
+  if [ -n "$only" ] && [ "$matched" = 0 ]; then
+    fcr_die "no task '$only' under $home"
+  fi
+
+  # Herdr must answer before anything is placed.
+  for session in ${sessions[@]+"${sessions[@]}"}; do
+    if ! fcr_herdr_wait "$session"; then
+      printf 'fcr: Herdr session %q did not answer within %ss; start or attach it (herdr --session %q) and run fcr resume again\n' \
+        "$session" "${FCR_HERDR_WAIT:-30}" "$session" >&2
+      exit 2
+    fi
+  done
+
+  # Pass 2: place and launch, in order.
+  for i in ${plan_idx[@]+"${plan_idx[@]}"}; do
+    label=${T_LABEL[i]} kind=${T_KIND[i]} meta=${T_META[i]} record=${T_RECORD[i]} inbox=${T_INBOX[i]}
+    rec=$(jq -c . "$record")
+    sid=$(printf '%s' "$rec" | jq -r '.session_id')
+    cwd=$(printf '%s' "$rec" | jq -r '.cwd')
+    session='' ws='' tab='' pane=''
+    if [ -n "$meta" ]; then
+      session=$(fcr_meta_get "$meta" herdr_session)
+      ws=$(fcr_meta_get "$meta" herdr_workspace_id)
+      tab=$(fcr_meta_get "$meta" herdr_tab_id)
+      pane=$(fcr_meta_get "$meta" herdr_pane_id)
+    fi
+    [ -n "$session" ] || session=$(printf '%s' "$rec" | jq -r '.herdr.session // empty')
+    [ -n "$ws" ] || ws=$(printf '%s' "$rec" | jq -r '.herdr.workspace_id // empty')
+    [ -n "$tab" ] || tab=$(printf '%s' "$rec" | jq -r '.herdr.tab_id // empty')
+    [ -n "$pane" ] || pane=$(printf '%s' "$rec" | jq -r '.herdr.pane_id // empty')
+
+    # A task the previous steps (or firstmate) brought back meanwhile.
+    if pid=$(fcr_alive_pid "$inbox" "$sid"); then
+      fcr_say alive "$label" "claude pid $pid already running (session $sid)"
+      alive=$((alive + 1)); continue
+    fi
+
+    note=$(fcr_restart_note "$sid")
+    argv=()
+    while IFS= read -r -d '' out; do argv+=("$out"); done < <(printf '%s' "$rec" | jq -j '.argv[] | (. + "\u0000")')
+    newargv=()
+    while IFS= read -r -d '' out; do newargv+=("$out"); done < <(fcr_rewrite_argv "$sid" "$note" "${argv[@]}")
+
+    state=$(fcr_pane_state "$session" "$pane")
+    place=''
+    if [ "$state" = present ]; then
+      if fcr_pane_idle "$session" "$pane"; then
+        place=reuse
+      else
+        place=newtab
+      fi
+    elif [ "$state" = gone ]; then
+      if fcr_workspace_exists "$session" "$ws"; then place=newtab; else place=newws; fi
+    else
+      fcr_say failed "$label" "could not read Herdr pane $session:$pane"
+      failed=$((failed + 1)); continue
+    fi
+    if [ "$place" = newtab ] && ! fcr_workspace_exists "$session" "$ws"; then
+      place=newws
+    fi
+
+    if [ "$dry" = 1 ]; then
+      case "$place" in
+        reuse) fcr_say "would resume" "$label" "session $sid in existing pane $session:$pane, cwd $cwd" ;;
+        newtab) fcr_say "would resume" "$label" "session $sid in a new tab of workspace $session:$ws (pane $pane ${state/present/is busy}), cwd $cwd" ;;
+        newws) fcr_say "would resume" "$label" "session $sid in a new workspace of $session (workspace ${ws:-<none>} gone), cwd $cwd" ;;
+      esac
+      [ "$verbose" = 0 ] || printf '              cmd: %s\n' "$(fcr_shell_join "${newargv[@]}")"
+      resumed=$((resumed + 1))
+      continue
+    fi
+
+    newws=$ws newtab=$tab newpane=$pane
+    if [ "$place" = reuse ]; then
+      read -r newws newtab < <(fcr_pane_tab "$session" "$pane")
+      [ -n "$newws" ] || newws=$ws
+      [ -n "$newtab" ] || newtab=$tab
+    else
+      # Firstmate looks its home workspace up by the label "firstmate" and
+      # refuses to guess between duplicates, so only the primary may use it.
+      local tab_label=fm-${label##*/} ws_label=fm-${label##*/}
+      case "$kind" in
+        primary) tab_label=firstmate ws_label=firstmate ;;
+        secondmate) ws_label=2ndmate-${label##*/} ;;
+      esac
+      if [ "$place" = newtab ]; then
+        out=$(fcr_herdr "$session" tab create --workspace "$ws" --cwd "$cwd" --label "$tab_label" --no-focus 2>/dev/null)
+        newws=$ws
+        newtab=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
+        newpane=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
+      else
+        out=$(fcr_herdr "$session" workspace create --cwd "$cwd" --label "$ws_label" --no-focus 2>/dev/null)
+        newws=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
+        newtab=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
+        newpane=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
+        [ -z "$newtab" ] || fcr_herdr "$session" tab rename "$newtab" "$tab_label" >/dev/null 2>&1 || true
+      fi
+      if [ -z "$newws" ] || [ -z "$newtab" ] || [ -z "$newpane" ]; then
+        fcr_say failed "$label" "could not create a Herdr $([ "$place" = newtab ] && echo tab || echo workspace) in session $session"
+        failed=$((failed + 1)); continue
+      fi
+    fi
+
+    mkdir -p "$launch_dir" 2>/dev/null && chmod 700 "$launch_dir" 2>/dev/null
+    launcher="$launch_dir/$(printf '%s' "$home" | cksum | cut -d' ' -f1)-${label//\//--}.sh"
+    if ! fcr_write_launcher "$launcher" "$cwd" "$(printf '%s' "$rec" | jq -c '.env // {}')" "${newargv[@]}"; then
+      fcr_say failed "$label" "could not write launcher $launcher"
+      failed=$((failed + 1)); continue
+    fi
+    if ! fcr_herdr "$session" pane run "$newpane" "bash $(printf '%q' "$launcher")" >/dev/null 2>&1; then
+      fcr_say failed "$label" "herdr pane run failed in $session:$newpane"
+      failed=$((failed + 1)); continue
+    fi
+    if [ -n "$meta" ] && { [ "$newws:$newtab:$newpane" != "$ws:$tab:$pane" ] ||
+      [ "$(fcr_meta_get "$meta" window)" != "$session:$newpane" ]; }; then
+      if ! fcr_meta_set_placement "$meta" "$session" "$newws" "$newtab" "$newpane"; then
+        fcr_say failed "$label" "resumed in $session:$newpane but could not update $meta"
+        failed=$((failed + 1)); continue
+      fi
+    fi
+    if ! fcr_wait_launched "$inbox" "$sid"; then
+      fcr_say failed "$label" "no claude for session $sid appeared in $session:$newpane within ${FCR_LAUNCH_WAIT:-20}s (launcher $launcher)"
+      failed=$((failed + 1)); continue
+    fi
+    case "$place" in
+      reuse) fcr_say resumed "$label" "session $sid in its pane $session:$newpane" ;;
+      newtab) fcr_say resumed "$label" "session $sid in new tab $newtab (pane $session:$newpane); meta updated" ;;
+      newws) fcr_say resumed "$label" "session $sid in new workspace $newws (pane $session:$newpane); meta updated" ;;
+    esac
+    resumed=$((resumed + 1))
+  done
+
+  if [ "$dry" = 1 ]; then
+    printf 'plan: %s to resume, %s alive, %s skipped\n' "$resumed" "$alive" "$skipped"
+  else
+    printf 'done: %s resumed, %s alive, %s skipped, %s failed\n' "$resumed" "$alive" "$skipped" "$failed"
+  fi
+  [ "$failed" = 0 ]
+}
+
+case "${1:-}" in
+  resume) shift; fcr_resume "$@" || exit 1 ;;
+  version|--version|-V) printf 'fcr %s\n' "$FCR_VERSION" ;;
+  help|-h|--help) fcr_help ;;
+  '') fcr_usage >&2; exit 2 ;;
+  *) fcr_usage >&2; fcr_die "unknown command: $1" ;;
+esac

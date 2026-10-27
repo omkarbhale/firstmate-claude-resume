@@ -3,10 +3,12 @@
 # its JSON shapes, over a state file in $FAKE_HERDR_DIR.
 #
 #   state.json   {"next": N, "workspaces": {id: {label}}, "tabs": {id: {ws, label}},
-#                 "panes": {id: {ws, tab, cwd, fg: [process names]}}}
+#                 "panes": {id: {ws, tab, cwd, fg: [process names], agent: name}}}
+#                (agent is optional: the agent Herdr detects in the pane)
 #   calls.log    every invocation, one line, arguments separated by " | "
 #   down         when present, status reports the server as not running
 #   fail-run     when present, `pane run` fails
+#   fail-close   when present, `pane close` fails
 #
 # Every call must carry `--session $FAKE_HERDR_SESSION`, or it fails with
 # error code session_mismatch. `pane run` really runs the command (detached)
@@ -42,7 +44,7 @@ save() {  # <jq filter> [args...]
 }
 pane_json() {  # <pane-id>
   jq -c --arg p "$1" '.panes[$p] as $x | {pane_id: $p, workspace_id: $x.ws, tab_id: $x.tab, cwd: $x.cwd,
-    foreground_cwd: $x.cwd, agent_status: "unknown", focused: false}' "$state"
+    foreground_cwd: $x.cwd, agent_status: "unknown", focused: false} + if $x.agent then {agent: $x.agent} else {} end' "$state"
 }
 
 if [ "${1:-}" = status ]; then
@@ -60,6 +62,22 @@ case "${1:-} ${2:-}" in
   "pane get")
     jq -e --arg p "$3" '.panes[$p]' "$state" >/dev/null || err pane_not_found "pane $3 not found"
     jq -cn --argjson pane "$(pane_json "$3")" '{id: "cli:pane:get", result: {type: "pane_info", pane: $pane}}'
+    ;;
+  "pane list")
+    jq -c '{id: "cli:pane:list", result: {type: "pane_list", panes: [.panes | to_entries[]
+      | {pane_id: .key, workspace_id: .value.ws, tab_id: .value.tab, cwd: .value.cwd, agent_status: "unknown"}
+        + if .value.agent then {agent: .value.agent} else {} end]}}' "$state"
+    ;;
+  "pane close")
+    jq -e --arg p "$3" '.panes[$p]' "$state" >/dev/null || err pane_not_found "pane $3 not found"
+    [ ! -e "$dir/fail-close" ] || err close_failed "pane close failed"
+    # Like Herdr, a tab goes with its last pane.
+    save '.panes[$p].tab as $t | del(.panes[$p]) | if any(.panes[]; .tab == $t) then . else del(.tabs[$t]) end' --arg p "$3"
+    jq -cn '{id: "cli:pane:close", result: {type: "ok"}}'
+    ;;
+  "agent list")
+    jq -c '{id: "cli:agent:list", result: {type: "agent_list", agents: [.panes | to_entries[]
+      | select(.value.agent) | {name: .value.agent, pane_id: .key, agent_status: "idle"}]}}' "$state"
     ;;
   "pane process-info")
     [ "$3" = --pane ] || err bad_args "process-info needs --pane"

@@ -67,6 +67,27 @@ To cover a fleet that is already running, restart its sessions (or wait for its 
 
 The primary is included only when `<home>/bin/fm-lock.sh status` reports no live owner, and it is resumed last, after everything it supervises is running again.
 
+### Closing the blank panes left over
+
+Herdr restores its saved layout as blank panes: shells with nothing running in them.
+`fcr resume` reuses the ones that belong to recorded tasks; the rest stay unless you ask:
+
+```sh
+fcr resume --dry-run --close-blank   # list the blank panes it would close
+fcr resume --close-blank
+```
+
+After the resume, `--close-blank` looks at every pane in each Herdr session the walked homes record and closes a pane only when all of these hold:
+
+- its foreground is only a shell, and Herdr reports no agent in it;
+- no task meta in the home or its second mate homes names it, and neither does the session record of a task just resumed or the primary's record;
+- it is not the pane `fcr` itself runs in (`$HERDR_PANE_ID`).
+
+Every pane is checked again right before its close, and kept on any doubt, such as Herdr not answering.
+It prints one line per pane, `closed` or `kept` with the reason.
+Panes are closed one at a time with `herdr pane close`; a workspace or tab is never closed directly, but a tab whose last pane closes goes with it, as it does in Herdr.
+A failed close is reported as `failed` and does not change the exit status of the resume.
+
 ### Why before the primary
 
 Run `fcr resume` first.

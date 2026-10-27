@@ -4,6 +4,7 @@
 #
 # Usage:
 #   fcr resume [--home <dir>] [--only <task-id>|primary] [--dry-run] [--verbose]
+#              [--close-blank]
 #   fcr version
 #   fcr help
 #
@@ -27,11 +28,23 @@
 # herdr_tab_id and herdr_pane_id are rewritten in the task's meta (temp file
 # plus rename). Every Herdr call passes the recorded --session explicitly.
 #
+# Blank panes (--close-blank): after the resume pass, every Herdr session the
+# walked homes record is searched for panes nothing uses, and each one is
+# closed with `herdr pane close`. A pane is closed only when its foreground is
+# only a shell, Herdr reports no agent in it, no task meta in a walked home
+# names it, no session record of a task resumed in this run (nor the primary's
+# record) names it, and it is not the pane fcr runs in ($HERDR_PANE_ID). All of
+# that is checked again immediately before each close; any doubt keeps the
+# pane. A tab whose last pane closes goes with it. One line per pane; a failed
+# close is reported but does not change the exit status.
+#
 # Options:
 #   --home <dir>     firstmate home to walk (default: $FCR_HOME or ~/firstmate)
 #   --only <id>      act on one task id (any depth), or `primary`
 #   --dry-run        print the plan; change nothing (Herdr is only read)
 #   --verbose        also print each resume command line
+#   --close-blank    then close blank panes nothing uses (see above); with
+#                    --dry-run, list the panes it would close
 #
 # Environment:
 #   FCR_HERDR          herdr executable (default: herdr)
@@ -53,7 +66,7 @@ fcr_die() {
 }
 
 fcr_usage() {
-  sed -n '5,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '5,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 fcr_help() {
@@ -314,6 +327,7 @@ fcr_walk_home() {
   FCR_VISITED="${FCR_VISITED:-} $real"
   state="$home/state"
   [ -d "$state" ] || return 0
+  FCR_HOMES+=("$home")
   local -a secondmates=() others=()
   for meta in "$state"/*.meta; do
     [ -f "$meta" ] || continue
@@ -386,10 +400,123 @@ fcr_say() {  # <outcome> <label> <detail>
   printf '%-13s %-28s %s\n' "$1" "$2" "$3"
 }
 
+# --- blank panes -----------------------------------------------------------------
+
+# fcr_named_panes: print "<session>\t<pane>\t<owner>" for every pane a task meta
+# in a walked home names, read fresh from disk, plus the entries in
+# FCR_KEEP_PANES (records of tasks resumed in this run, and the primary's). An
+# empty session means the owner did not say which session, so it matches all.
+fcr_named_panes() {
+  local home meta id session pane window
+  for home in ${FCR_HOMES[@]+"${FCR_HOMES[@]}"}; do
+    for meta in "$home"/state/*.meta; do
+      [ -f "$meta" ] || continue
+      id=${meta##*/}
+      id=${id%.meta}
+      session=$(fcr_meta_get "$meta" herdr_session)
+      pane=$(fcr_meta_get "$meta" herdr_pane_id)
+      window=$(fcr_meta_get "$meta" window)
+      [ -z "$pane" ] || printf '%s\t%s\t%s\n' "$session" "$pane" "task $id"
+      [ -z "$window" ] || printf '%s\t%s\t%s\n' "$session" "${window#"$session":}" "task $id"
+    done
+  done
+  [ -z "${FCR_KEEP_PANES:-}" ] || printf '%s' "$FCR_KEEP_PANES"
+}
+
+# fcr_pane_owner <session> <pane>: print who names the pane, or fail.
+fcr_pane_owner() {
+  local s p owner
+  while IFS=$'\t' read -r s p owner; do
+    [ "$p" = "$2" ] || continue
+    [ -z "$s" ] || [ "$s" = "$1" ] || continue
+    printf '%s' "$owner"
+    return 0
+  done < <(fcr_named_panes)
+  return 1
+}
+
+# fcr_pane_agent <session> <pane>: print the agent Herdr reports in the pane
+# ("unreadable" when Herdr does not answer), or fail when it reports none.
+fcr_pane_agent() {
+  local out agent
+  out=$(fcr_herdr "$1" agent list 2>/dev/null)
+  printf '%s' "$out" | jq -e '.result.agents | type == "array"' >/dev/null 2>&1 || { printf 'unreadable'; return 0; }
+  agent=$(printf '%s' "$out" | jq -r --arg p "$2" '
+    first(.result.agents[] | select(any(.. | objects; .pane_id? == $p or .pane? == $p))
+      | (.name // .kind // .agent // "unnamed") | tostring) // empty' 2>/dev/null)
+  if [ -z "$agent" ]; then
+    out=$(fcr_herdr "$1" pane get "$2" 2>/dev/null)
+    agent=$(printf '%s' "$out" | jq -r '.result.pane.agent // empty | if type == "string" then . else tostring end' 2>/dev/null)
+  fi
+  [ -n "$agent" ] || return 1
+  printf '%s' "$agent"
+}
+
+# fcr_blank_reason <session> <pane>: print why the pane must stay, or fail
+# when it is provably unused.
+fcr_blank_reason() {
+  local owner agent
+  if [ -n "${HERDR_PANE_ID:-}" ] && [ "$2" = "$HERDR_PANE_ID" ]; then
+    printf 'the pane fcr runs in'; return 0
+  fi
+  if owner=$(fcr_pane_owner "$1" "$2"); then
+    printf 'named by %s' "$owner"; return 0
+  fi
+  if [ "$(fcr_pane_state "$1" "$2")" != present ]; then
+    printf 'could not read the pane'; return 0
+  fi
+  if agent=$(fcr_pane_agent "$1" "$2"); then
+    [ "$agent" = unreadable ] && printf 'could not read Herdr agents' || printf 'Herdr reports agent %s' "$agent"
+    return 0
+  fi
+  if ! fcr_pane_idle "$1" "$2"; then
+    printf 'running a process'; return 0
+  fi
+  return 1
+}
+
+# fcr_close_blank <dry> <session...>: close (or list) the blank panes in each
+# session. Sets FCR_BLANK_CLOSED, FCR_BLANK_KEPT and FCR_BLANK_FAILED.
+fcr_close_blank() {
+  local dry=$1 session out pane reason
+  shift
+  FCR_BLANK_CLOSED=0 FCR_BLANK_KEPT=0 FCR_BLANK_FAILED=0
+  for session in "$@"; do
+    out=$(fcr_herdr "$session" pane list 2>/dev/null)
+    if ! printf '%s' "$out" | jq -e '.result.panes | type == "array"' >/dev/null 2>&1; then
+      fcr_say failed "$session" "could not list Herdr panes; no blank pane closed in this session"
+      FCR_BLANK_FAILED=$((FCR_BLANK_FAILED + 1)); continue
+    fi
+    while IFS= read -r pane; do
+      [ -n "$pane" ] || continue
+      if reason=$(fcr_blank_reason "$session" "$pane"); then
+        fcr_say kept "$session:$pane" "$reason"
+        FCR_BLANK_KEPT=$((FCR_BLANK_KEPT + 1)); continue
+      fi
+      if [ "$dry" = 1 ]; then
+        fcr_say "would close" "$session:$pane" "blank shell, nothing uses it"
+        FCR_BLANK_CLOSED=$((FCR_BLANK_CLOSED + 1)); continue
+      fi
+      # Prove it again right before the close: the fleet may have moved.
+      if reason=$(fcr_blank_reason "$session" "$pane"); then
+        fcr_say kept "$session:$pane" "$reason (on the final check)"
+        FCR_BLANK_KEPT=$((FCR_BLANK_KEPT + 1)); continue
+      fi
+      if fcr_herdr "$session" pane close "$pane" >/dev/null 2>&1; then
+        fcr_say closed "$session:$pane" "blank shell, nothing used it"
+        FCR_BLANK_CLOSED=$((FCR_BLANK_CLOSED + 1))
+      else
+        fcr_say failed "$session:$pane" "herdr pane close failed"
+        FCR_BLANK_FAILED=$((FCR_BLANK_FAILED + 1))
+      fi
+    done < <(printf '%s' "$out" | jq -r '.result.panes[].pane_id // empty' 2>/dev/null)
+  done
+}
+
 # --- resume ----------------------------------------------------------------------
 
 fcr_resume() {
-  local home=${FCR_HOME:-$HOME/firstmate} only='' dry=0 verbose=0
+  local home=${FCR_HOME:-$HOME/firstmate} only='' dry=0 verbose=0 close_blank=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --home) [ "$#" -ge 2 ] || fcr_die "--home needs a directory"; home=$2; shift 2 ;;
@@ -398,6 +525,7 @@ fcr_resume() {
       --only=*) only=${1#*=}; shift ;;
       --dry-run|-n) dry=1; shift ;;
       --verbose|-v) verbose=1; shift ;;
+      --close-blank) close_blank=1; shift ;;
       -h|--help) fcr_help; return 0 ;;
       *) fcr_usage >&2; fcr_die "unknown argument: $1" ;;
     esac
@@ -408,7 +536,7 @@ fcr_resume() {
   [ -d "$home/state" ] || fcr_die "not a firstmate home (no state/): $home"
 
   T_LABEL=() T_KIND=() T_META=() T_RECORD=() T_INBOX=() T_HOME=()
-  FCR_VISITED=''
+  FCR_VISITED='' FCR_HOMES=() FCR_KEEP_PANES=''
   fcr_walk_home "$home" ''
   if [ -f "$home/state/.primary-claude-session" ]; then
     fcr_add_task primary primary "" "$home/state/.primary-claude-session" "" "$home"
@@ -417,11 +545,29 @@ fcr_resume() {
   local n=${#T_LABEL[@]} i label kind meta record inbox rec sid cwd transcript session
   local pid lock reason ws tab pane state place newws newtab newpane out note launcher
   local launch_dir failed=0 resumed=0 alive=0 skipped=0 matched=0
-  local -a plan_idx=() sessions=() argv=() newargv=()
+  local -a plan_idx=() sessions=() argv=() newargv=() blank_sessions=()
   launch_dir=${FCR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate-claude-resume}/launch
 
   [ "$dry" = 0 ] || printf 'fcr resume --dry-run: nothing will be changed\n'
   printf 'home: %s\n' "$home"
+
+  # Every Herdr session the walked homes record, for --close-blank.
+  if [ "$close_blank" = 1 ]; then
+    for ((i = 0; i < n; i++)); do
+      meta=${T_META[i]} record=${T_RECORD[i]} session=''
+      [ -z "$meta" ] || [ "$(fcr_meta_get "$meta" backend)" = herdr ] || continue
+      [ -z "$meta" ] || session=$(fcr_meta_get "$meta" herdr_session)
+      if [ -z "$session" ] && [ -n "$record" ] && [ -f "$record" ]; then
+        session=$(jq -r '.herdr.session // empty' "$record" 2>/dev/null)
+      fi
+      [ -n "$session" ] || continue
+      case " ${blank_sessions[*]+${blank_sessions[*]}} " in *" $session "*) ;; *) blank_sessions+=("$session") ;; esac
+      # The primary has no meta; its recorded pane is where it comes back.
+      if [ "${T_KIND[i]}" = primary ]; then
+        FCR_KEEP_PANES+=$(jq -r '"\(.herdr.session // "")\t\(.herdr.pane_id // "")\tthe primary'"'"'s session record"' "$record" 2>/dev/null)$'\n'
+      fi
+    done
+  fi
 
   # Pass 1: classify without touching anything.
   for ((i = 0; i < n; i++)); do
@@ -605,6 +751,8 @@ fcr_resume() {
       fcr_say failed "$label" "no claude for session $sid appeared in $session:$newpane within ${FCR_LAUNCH_WAIT:-20}s (launcher $launcher)"
       failed=$((failed + 1)); continue
     fi
+    FCR_KEEP_PANES+="$session"$'\t'"$newpane"$'\t'"$label's session record"$'\n'
+    FCR_KEEP_PANES+="$session"$'\t'"$pane"$'\t'"$label's session record"$'\n'
     case "$place" in
       reuse) fcr_say resumed "$label" "session $sid in its pane $session:$newpane" ;;
       newtab) fcr_say resumed "$label" "session $sid in new tab $newtab (pane $session:$newpane); meta updated" ;;
@@ -613,10 +761,19 @@ fcr_resume() {
     resumed=$((resumed + 1))
   done
 
+  if [ "$close_blank" = 1 ]; then
+    printf 'blank panes:\n'
+    fcr_close_blank "$dry" ${blank_sessions[@]+"${blank_sessions[@]}"}
+  fi
+
   if [ "$dry" = 1 ]; then
     printf 'plan: %s to resume, %s alive, %s skipped\n' "$resumed" "$alive" "$skipped"
+    [ "$close_blank" = 0 ] || printf 'plan: %s blank panes to close, %s kept, %s failed\n' \
+      "$FCR_BLANK_CLOSED" "$FCR_BLANK_KEPT" "$FCR_BLANK_FAILED"
   else
     printf 'done: %s resumed, %s alive, %s skipped, %s failed\n' "$resumed" "$alive" "$skipped" "$failed"
+    [ "$close_blank" = 0 ] || printf 'blank panes: %s closed, %s kept, %s failed (does not change the exit status)\n' \
+      "$FCR_BLANK_CLOSED" "$FCR_BLANK_KEPT" "$FCR_BLANK_FAILED"
   fi
   [ "$failed" = 0 ]
 }

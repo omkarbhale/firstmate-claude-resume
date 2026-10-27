@@ -19,9 +19,10 @@
 # What it records: the session id, cwd, source event, transcript path, the
 # Herdr session/workspace/tab/pane from the HERDR_* variables, a capture time,
 # the exact launch argv of the owning `claude` process (read from /proc by
-# walking this hook's ancestry, never reconstructed), and an allowlisted slice
-# of that process's launch environment (FCR_ENV_ALLOW below). Names that look
-# like credentials are dropped even when allowlisted (FCR_ENV_DENY).
+# walking this hook's ancestry, never reconstructed), an allowlisted slice of
+# that process's launch environment (FCR_ENV_ALLOW below; names that look like
+# credentials are dropped even when allowlisted, FCR_ENV_DENY), and
+# previous_sessions: the last 10 ids the record named before, newest first.
 #
 # It skips `--print` sessions and nested Claude processes, so a child can never
 # overwrite its parent task's record. A nested claude is one whose own launch
@@ -81,7 +82,7 @@ fcr_hook_find_claude() {
 
 fcr_hook_main() {
   local input='' session_id cwd source transcript inbox state task_id target kind
-  local claude_pid argv_json env_json herdr_session tmp now_iso now_epoch
+  local claude_pid argv_json env_json herdr_session tmp now_iso now_epoch previous
 
   IFS= read -r -d '' -t 5 input || true
   [ -n "$input" ] || { fcr_hook_debug "skip: empty stdin"; return 0; }
@@ -151,6 +152,16 @@ fcr_hook_main() {
   fi
   [ -n "$herdr_session" ] || [ -z "${HERDR_PANE_ID:-}" ] || herdr_session=default
 
+  # Keep the ids this record named before, newest first, so a session that a
+  # fresh start replaced (say, a primary reopened before `fcr resume` ran) can
+  # still be resumed by hand.
+  previous=$(jq -c --arg sid "$session_id" '
+    (.previous_sessions // []) as $p
+    | if .session_id != $sid
+      then [{session_id, captured_at, source, transcript_path}] + $p else $p end
+    | map(select(.session_id != $sid)) | .[:10]' "$target" 2>/dev/null) || previous='[]'
+  printf '%s' "$previous" | jq -e 'type == "array"' >/dev/null 2>&1 || previous='[]'
+
   now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   now_epoch=$(date +%s)
   tmp="$state/.${target##*/}.tmp.$$"
@@ -162,13 +173,14 @@ fcr_hook_main() {
       --arg transcript "$transcript" --arg captured_at "$now_iso" --argjson captured_epoch "$now_epoch" \
       --arg hs "$herdr_session" --arg hw "${HERDR_WORKSPACE_ID:-}" \
       --arg ht "${HERDR_TAB_ID:-}" --arg hp "${HERDR_PANE_ID:-}" \
-      --argjson claude_pid "$claude_pid" --argjson argv "$argv_json" --argjson env "$env_json" '
+      --argjson claude_pid "$claude_pid" --argjson argv "$argv_json" --argjson env "$env_json" \
+      --argjson previous "$previous" '
       {
         format: 1, kind: $kind, task_id: $task_id, state_dir: $state_dir,
         session_id: $session_id, source: $source, cwd: $cwd, transcript_path: $transcript,
         captured_at: $captured_at, captured_epoch: $captured_epoch,
         herdr: {session: $hs, workspace_id: $hw, tab_id: $ht, pane_id: $hp},
-        claude_pid: $claude_pid, argv: $argv, env: $env
+        claude_pid: $claude_pid, argv: $argv, env: $env, previous_sessions: $previous
       }' >"$tmp"
   ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; fcr_hook_debug "error: could not write $tmp"; return 0; }
   mv -f "$tmp" "$target" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; fcr_hook_debug "error: could not write $target"; return 0; }

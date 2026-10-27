@@ -20,8 +20,10 @@
 # only when `<home>/bin/fm-lock.sh status` reports no live owner.
 #
 # Placement: the task's recorded Herdr pane is reused when it still exists and
-# holds only a shell. Otherwise a new tab is created in the recorded workspace,
-# or a new workspace when that is gone too, and ONLY window, herdr_workspace_id,
+# holds only a shell. Otherwise a new tab labeled fm-<task-id> is created in the
+# recorded workspace, or a new workspace when that is gone too (labeled
+# fm-<task-id>, 2ndmate-<id> for a second mate, firstmate for the primary
+# only), and ONLY window, herdr_workspace_id,
 # herdr_tab_id and herdr_pane_id are rewritten in the task's meta (temp file
 # plus rename). Every Herdr call passes the recorded --session explicitly.
 #
@@ -189,8 +191,10 @@ fcr_restart_note() {  # <session-id>
 
 # --- liveness ----------------------------------------------------------------
 
-# fcr_live_claude_scan: print one line per live claude process owned by this
-# user: "<pid>\t<FM_TASK_INBOX or ->\t<cwd>\t<session ids named in argv>".
+# fcr_live_claude_scan: print one line per live interactive claude process
+# owned by this user: "<pid>\t<FM_TASK_INBOX or ->\t<cwd>\t<session ids named
+# in argv>". One-shot `claude -p` helpers (firstmate's supervision host runs
+# them inside a task's environment) never count as the task's agent.
 fcr_live_claude_scan() {
   local d pid comm argv0 inbox cwd ids uid
   uid=$(id -u)
@@ -201,6 +205,7 @@ fcr_live_claude_scan() {
     argv0=''
     IFS= read -r -d '' argv0 <"$d/cmdline" 2>/dev/null || true
     [ "$comm" = claude ] || [ "${argv0##*/}" = claude ] || continue
+    tr '\0' '\n' <"$d/cmdline" 2>/dev/null | grep -qx -e '-p' -e '--print' && continue
     inbox=$(tr '\0' '\n' <"$d/environ" 2>/dev/null | sed -n 's/^FM_TASK_INBOX=//p' | head -n 1)
     cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=''
     ids=$(tr '\0' '\n' <"$d/cmdline" 2>/dev/null | awk '
@@ -554,11 +559,13 @@ fcr_resume() {
       [ -n "$newws" ] || newws=$ws
       [ -n "$newtab" ] || newtab=$tab
     else
-      local tab_label=fm-${label##*/} ws_label=firstmate
-      [ "$kind" != primary ] || tab_label=firstmate
-      if [ -f "${T_HOME[i]}/.fm-secondmate-home" ]; then
-        ws_label="2ndmate-$(tr -d '[:space:]' <"${T_HOME[i]}/.fm-secondmate-home")"
-      fi
+      # Firstmate looks its home workspace up by the label "firstmate" and
+      # refuses to guess between duplicates, so only the primary may use it.
+      local tab_label=fm-${label##*/} ws_label=fm-${label##*/}
+      case "$kind" in
+        primary) tab_label=firstmate ws_label=firstmate ;;
+        secondmate) ws_label=2ndmate-${label##*/} ;;
+      esac
       if [ "$place" = newtab ]; then
         out=$(fcr_herdr "$session" tab create --workspace "$ws" --cwd "$cwd" --label "$tab_label" --no-focus 2>/dev/null)
         newws=$ws

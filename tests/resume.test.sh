@@ -77,6 +77,8 @@ make_record "$H" primary "$S_PRI" "$H" w1:p1 '["claude","--model","opus"]'
 # Live sessions: one by task inbox (a fresh firstmate relaunch), one by id.
 start_claude "FM_TASK_INBOX=$H/state/t-atask.inbox" -- --model sonnet 'fresh relaunch' >/dev/null
 start_claude -- --resume "$S_ASID" >/dev/null
+# A one-shot helper in a dead task's environment is not that task's agent.
+start_claude "FM_TASK_INBOX=$H/state/t-reuse.inbox" -- -p 'supervision wake' >/dev/null
 sleep 0.5
 
 snapshot() { cat "$H"/state/*.meta "$H2"/state/*.meta | md5sum; }
@@ -178,7 +180,7 @@ mode=no-mistakes" "$(cat "$H/state/t-gone.meta")"
 check "gone pane: new pane is in the herdr state" jq -e --arg p "$gone_pane" '.panes[$p].ws == "w1"' "$FAKE_HERDR_DIR/state.json"
 check "meta rewrite leaves no temp file" bash -c "! ls -A '$H/state' | grep -q fcr"
 ws_new=$(meta_val "$H" herdr_workspace_id t-wsgone)
-assert_eq "gone workspace: a new workspace labeled like firstmate's" '"firstmate"' "$(jq --arg w "$ws_new" '.workspaces[$w].label' "$FAKE_HERDR_DIR/state.json")"
+assert_eq "gone workspace: a new workspace labeled for the task, never the home label" '"fm-t-wsgone"' "$(jq --arg w "$ws_new" '.workspaces[$w].label' "$FAKE_HERDR_DIR/state.json")"
 assert_eq "gone workspace: meta points at its pane" "fm-test:$(meta_val "$H" herdr_pane_id t-wsgone)" "$(meta_val "$H" window t-wsgone)"
 assert_eq "second mate's child resumed in its own pane" "w2:p1" "$(meta_val "$H2" herdr_pane_id c1)"
 launcher_dir="$XDG_STATE_HOME/firstmate-claude-resume/launch"

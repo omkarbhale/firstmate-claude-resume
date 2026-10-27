@@ -51,6 +51,10 @@ sid2=$(new_uuid)
 (cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" claude --resume "$sid2" --model sonnet 'note')
 assert_eq "a later session start rewrites the record with the current id" "$sid2" "$(jq -r .session_id "$record")"
 assert_eq "resume source is recorded" resume "$(jq -r .source "$record")"
+assert_eq "the replaced id is kept in previous_sessions, newest first" "$sid startup" \
+  "$(jq -r '.previous_sessions[0] | "\(.session_id) \(.source)"' "$record")"
+(cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" claude --resume "$sid2" --model sonnet 'note')
+assert_eq "restarting the same session adds no previous entry" 1 "$(jq '.previous_sessions | length' "$record")"
 
 # --- nested and --print sessions are skipped ----------------------------------
 before=$(cat "$record")

@@ -101,7 +101,7 @@ fcr_hook_main() {
     task_id=${inbox##*/}
     task_id=${task_id%.inbox}
     case "$inbox" in /*.inbox) ;; *) fcr_hook_debug "skip: malformed FM_TASK_INBOX=$inbox"; return 0 ;; esac
-    [ -n "$task_id" ] && [ -d "$state" ] || { fcr_hook_debug "skip: no state dir for $inbox"; return 0; }
+    if [ -z "$task_id" ] || [ ! -d "$state" ]; then fcr_hook_debug "skip: no state dir for $inbox"; return 0; fi
     target="$state/$task_id.claude-session"
     kind=task
   elif [ -f "$cwd/bin/fm-lock.sh" ] && [ -f "$cwd/bin/fm-spawn.sh" ]; then

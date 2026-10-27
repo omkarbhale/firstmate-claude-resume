@@ -36,8 +36,9 @@ done
 [ "${#config_dirs[@]}" -gt 0 ] || config_dirs=("${CLAUDE_CONFIG_DIR:-$HOME/.claude}")
 
 command -v jq >/dev/null 2>&1 || fcr_settings_die "jq is required"
-[ -f "$SRC_DIR/bin/fcr" ] && [ -f "$SRC_DIR/bin/fcr-session-hook" ] ||
+if [ ! -f "$SRC_DIR/bin/fcr" ] || [ ! -f "$SRC_DIR/bin/fcr-session-hook" ]; then
   fcr_settings_die "run install.sh from a firstmate-claude-resume checkout"
+fi
 
 # Refuse malformed settings before changing anything at all.
 for dir in "${config_dirs[@]}"; do

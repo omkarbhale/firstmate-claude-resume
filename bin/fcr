@@ -4,7 +4,7 @@
 #
 # Usage:
 #   fcr resume [--home <dir>] [--only <task-id>|primary] [--dry-run] [--verbose]
-#              [--close-blank]
+#              [--no-prompt|--prompt] [--close-blank]
 #   fcr version
 #   fcr help
 #
@@ -14,7 +14,8 @@
 #   alive      a live `claude` process already runs that session id or task
 #              (firstmate relaunched it, or it never died) - left alone
 #   resume     resumed with `claude --resume <id>` in its recorded cwd, with its
-#              recorded argv and environment and a short restart note
+#              recorded argv and environment, and a short restart note only
+#              when it was working when it stopped (see Restart note)
 #   skip       not resumable, with the reason
 # Order: second mates first, each followed by its own tasks, then the home's
 # other tasks, and the primary firstmate session last. The primary is included
@@ -27,6 +28,24 @@
 # only), and ONLY window, herdr_workspace_id,
 # herdr_tab_id and herdr_pane_id are rewritten in the task's meta (temp file
 # plus rename). Every Herdr call passes the recorded --session explicitly.
+#
+# Restart note: the note tells a resumed session that the restart killed its
+# background work and to carry on, so it starts the session moving. By default
+# it is sent only to a session that was mid-turn when it stopped, read from the
+# last entry of the main conversation in its transcript (sidechain and meta
+# entries ignored, an unparseable line such as one cut off by the crash
+# skipped):
+#   working  an assistant message that did not finish its turn (stop reason
+#            tool_use, max_tokens or none) or an API error, a tool result, or a
+#            prompt not yet answered
+#   idle     an assistant message that ended its turn (end_turn or
+#            stop_sequence), "[Request interrupted by user...]", the output of
+#            a local slash command, or no conversation at all
+#   unknown  no transcript path recorded, or the transcript cannot be read
+# An idle or unknown session is resumed without a note: it comes back exactly
+# where it stopped and waits, since a session that was set moving cannot be
+# stopped after the fact, while a quiet one can be prompted at any time.
+# --no-prompt sends no note to any session; --prompt sends it to every one.
 #
 # Blank panes (--close-blank): after the resume pass, every Herdr session the
 # walked homes record is searched for panes nothing uses, and each one is
@@ -43,6 +62,10 @@
 #   --only <id>      act on one task id (any depth), or `primary`
 #   --dry-run        print the plan; change nothing (Herdr is only read)
 #   --verbose        also print each resume command line
+#   --no-prompt      resume with no restart note, even a session that was
+#                    working: it comes back and waits (combine with --only)
+#   --prompt         send the restart note to every resumed session, even one
+#                    that was idle or whose state is unknown
 #   --close-blank    then close blank panes nothing uses (see above); with
 #                    --dry-run, list the panes it would close
 #
@@ -127,7 +150,7 @@ FCR_OPT_DROP=' -r --resume -c --continue --session-id --fork-session '
 # NUL. Keeps the executable (and a node/script prefix when present) and every
 # option with its values; drops prompt positionals, everything after "--", and
 # any --resume/--session-id/--continue/--fork-session; then appends
-# `--resume <id> <note>`.
+# `--resume <id>`, and the note when it is not empty.
 fcr_rewrite_argv() {
   local id=$1 note=$2 i n tok name has_eq drop
   shift 2
@@ -194,12 +217,44 @@ fcr_rewrite_argv() {
         ;;
     esac
   done
-  out+=(--resume "$id" "$note")
+  out+=(--resume "$id")
+  [ -z "$note" ] || out+=("$note")
   printf '%s\0' "${out[@]}"
 }
 
 fcr_restart_note() {  # <session-id>
   printf '%s' "[firstmate-claude-resume] The machine or the Herdr multiplexer restarted. This is the same Claude session ($1) resumed with its conversation intact, in its original folder and with its original settings. Everything that ran in the background did not survive the restart: background shell jobs, monitors, Workflows, subagents and any child processes you started are gone. Check what you had running and resume or restart it (resume an interrupted Workflow with resumeFromRunId), then carry on with your task."
+}
+
+# The jq program behind fcr_turn_state. Reads the transcript's lines newest
+# first (raw, so a broken line is skipped) and classifies the first entry of
+# the main conversation; see "Restart note" above.
+# shellcheck disable=SC2016 # A jq program, not shell.
+FCR_TURN_JQ='
+  def texts: .message.content
+    | if type == "string" then [.]
+      elif type == "array" then [.[] | objects
+        | (.text // (.content | if type == "string" then . elif type == "array" then (.[] | objects | .text) else empty end))
+        | strings]
+      else [] end;
+  first(inputs | fromjson? | objects
+    | select((.type == "user" or .type == "assistant") and .isSidechain != true and .isMeta != true)) // null
+  | if . == null then "idle"
+    elif .type == "assistant" then
+      if .isApiErrorMessage != true and (.message.stop_reason == "end_turn" or .message.stop_reason == "stop_sequence")
+      then "idle" else "working" end
+    elif any(texts[]; contains("[Request interrupted by user")) then "idle"
+    elif any(texts[]; startswith("<local-command-stdout>") or startswith("<local-command-stderr>")) then "idle"
+    else "working" end'
+
+# fcr_turn_state <transcript>: print working, idle or unknown - whether the
+# session was mid-turn when it stopped.
+fcr_turn_state() {
+  local st=''
+  if [ -n "$1" ] && [ -f "$1" ] && [ -r "$1" ]; then
+    st=$(tac -- "$1" 2>/dev/null | jq -nrR "$FCR_TURN_JQ" 2>/dev/null)
+  fi
+  case "$st" in idle | working) printf '%s' "$st" ;; *) printf 'unknown' ;; esac
 }
 
 # --- liveness ----------------------------------------------------------------
@@ -516,7 +571,7 @@ fcr_close_blank() {
 # --- resume ----------------------------------------------------------------------
 
 fcr_resume() {
-  local home=${FCR_HOME:-$HOME/firstmate} only='' dry=0 verbose=0 close_blank=0
+  local home=${FCR_HOME:-$HOME/firstmate} only='' dry=0 verbose=0 close_blank=0 prompt=auto
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --home) [ "$#" -ge 2 ] || fcr_die "--home needs a directory"; home=$2; shift 2 ;;
@@ -526,6 +581,12 @@ fcr_resume() {
       --dry-run|-n) dry=1; shift ;;
       --verbose|-v) verbose=1; shift ;;
       --close-blank) close_blank=1; shift ;;
+      --no-prompt)
+        [ "$prompt" != always ] || fcr_die "--no-prompt and --prompt cannot be combined"
+        prompt=never; shift ;;
+      --prompt)
+        [ "$prompt" != never ] || fcr_die "--no-prompt and --prompt cannot be combined"
+        prompt=always; shift ;;
       -h|--help) fcr_help; return 0 ;;
       *) fcr_usage >&2; fcr_die "unknown argument: $1" ;;
     esac
@@ -543,7 +604,7 @@ fcr_resume() {
   fi
 
   local n=${#T_LABEL[@]} i label kind meta record inbox rec sid cwd transcript session
-  local pid lock reason ws tab pane state place newws newtab newpane out note launcher
+  local pid lock reason ws tab pane state place newws newtab newpane out note launcher turn noted
   local launch_dir failed=0 resumed=0 alive=0 skipped=0 matched=0
   local -a plan_idx=() sessions=() argv=() newargv=() blank_sessions=()
   launch_dir=${FCR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate-claude-resume}/launch
@@ -664,7 +725,22 @@ fcr_resume() {
       alive=$((alive + 1)); continue
     fi
 
-    note=$(fcr_restart_note "$sid")
+    # The restart note goes only to a session that was working (or to all
+    # with --prompt, none with --no-prompt); see "Restart note" above.
+    note=''
+    case "$prompt" in
+      always) noted='restart note (--prompt)' ;;
+      never) noted='no restart note (--no-prompt)' ;;
+      *)
+        turn=$(fcr_turn_state "$(printf '%s' "$rec" | jq -r '.transcript_path // empty')")
+        case "$turn" in
+          working) noted='restart note (was working)' ;;
+          idle) noted='no restart note (was idle)' ;;
+          *) noted='no restart note (turn state unknown)' ;;
+        esac
+        ;;
+    esac
+    case "$noted" in restart*) note=$(fcr_restart_note "$sid") ;; esac
     argv=()
     while IFS= read -r -d '' out; do argv+=("$out"); done < <(printf '%s' "$rec" | jq -j '.argv[] | (. + "\u0000")')
     newargv=()
@@ -690,9 +766,9 @@ fcr_resume() {
 
     if [ "$dry" = 1 ]; then
       case "$place" in
-        reuse) fcr_say "would resume" "$label" "session $sid in existing pane $session:$pane, cwd $cwd" ;;
-        newtab) fcr_say "would resume" "$label" "session $sid in a new tab of workspace $session:$ws (pane $pane ${state/present/is busy}), cwd $cwd" ;;
-        newws) fcr_say "would resume" "$label" "session $sid in a new workspace of $session (workspace ${ws:-<none>} gone), cwd $cwd" ;;
+        reuse) fcr_say "would resume" "$label" "session $sid in existing pane $session:$pane, cwd $cwd; $noted" ;;
+        newtab) fcr_say "would resume" "$label" "session $sid in a new tab of workspace $session:$ws (pane $pane ${state/present/is busy}), cwd $cwd; $noted" ;;
+        newws) fcr_say "would resume" "$label" "session $sid in a new workspace of $session (workspace ${ws:-<none>} gone), cwd $cwd; $noted" ;;
       esac
       [ "$verbose" = 0 ] || printf '              cmd: %s\n' "$(fcr_shell_join "${newargv[@]}")"
       resumed=$((resumed + 1))
@@ -754,9 +830,9 @@ fcr_resume() {
     FCR_KEEP_PANES+="$session"$'\t'"$newpane"$'\t'"$label's session record"$'\n'
     FCR_KEEP_PANES+="$session"$'\t'"$pane"$'\t'"$label's session record"$'\n'
     case "$place" in
-      reuse) fcr_say resumed "$label" "session $sid in its pane $session:$newpane" ;;
-      newtab) fcr_say resumed "$label" "session $sid in new tab $newtab (pane $session:$newpane); meta updated" ;;
-      newws) fcr_say resumed "$label" "session $sid in new workspace $newws (pane $session:$newpane); meta updated" ;;
+      reuse) fcr_say resumed "$label" "session $sid in its pane $session:$newpane; $noted" ;;
+      newtab) fcr_say resumed "$label" "session $sid in new tab $newtab (pane $session:$newpane); meta updated; $noted" ;;
+      newws) fcr_say resumed "$label" "session $sid in new workspace $newws (pane $session:$newpane); meta updated; $noted" ;;
     esac
     resumed=$((resumed + 1))
   done

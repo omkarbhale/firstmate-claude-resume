@@ -110,6 +110,24 @@ make_record() {
      claude_pid: 1, argv: $argv, env: $env}' >"$file"
 }
 
+# transcript <session-id> <json-line>...: write the session's fixture
+# transcript (as make_record names it), one line per argument, oldest first.
+transcript() {
+  local sid=$1
+  shift
+  mkdir -p "$TEST_TMP/transcripts"
+  printf '%s\n' "$@" >"$TEST_TMP/transcripts/$sid.jsonl"
+}
+# Transcript lines, shaped like Claude Code's. Used by the sourcing test files.
+# shellcheck disable=SC2034
+{
+T_PROMPT='{"type":"user","message":{"role":"user","content":"do the task"}}'
+T_TOOL_USE='{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]}}'
+T_TOOL_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]},"toolUseResult":{}}'
+T_END_TURN='{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}'
+T_TURN_DURATION='{"type":"system","subtype":"turn_duration","durationMs":1000}'
+}
+
 # herdr_state <json>: replace the stub herdr's whole state.
 herdr_state() { printf '%s\n' "$1" >"$FAKE_HERDR_DIR/state.json"; }
 

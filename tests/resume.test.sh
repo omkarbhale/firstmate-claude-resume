@@ -47,6 +47,8 @@ make_record "$H" t-reuse "$S_REUSE" "$(wt t-reuse)" w1:p2 "$(std_argv "$(new_uui
   "$(jq -cn --arg inbox "$H/state/t-reuse.inbox" '{FM_TASK_INBOX: $inbox, FM_TASK_ID: "t-reuse", GIT_CONFIG_COUNT: "1",
      GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/hooks dir", COMPACT_ADVISER_DISABLE: "1",
      CLAUDE_CONFIG_DIR: "/cfg/it'"'"'s"}')"
+# t-reuse was mid-tool-call when it stopped, so it gets the restart note.
+transcript "$S_REUSE" "$T_PROMPT" "$T_TOOL_USE" "$T_TOOL_RESULT"
 make_meta "$H" t-busy "$(placement t-busy w1 w1:t3 w1:p3)"
 make_record "$H" t-busy "$S_BUSY" "$(wt t-busy)" w1:p3 '["claude","--model","sonnet","go"]'
 make_meta "$H" t-gone 'worktree=/somewhere' "$(placement t-gone w1 w1:t9 w1:p9)" 'branch=fm/t-gone' 'mode=no-mistakes'
@@ -65,6 +67,7 @@ make_meta "$H" t-codex harness=codex "$(placement t-codex w1 w1:t1 w1:p1)"
 make_meta "$H" t-argv "$(placement t-argv w1 w1:t1 w1:p1)"
 make_record "$H" t-argv "$S_ARGV" "$(wt t-argv)" w1:p1 \
   '["node","/opt/claude-code/cli.js","--model","opus","--debug","--","p1","p2"]'
+transcript "$S_ARGV" "$T_PROMPT"  # an unanswered prompt: working
 # A second mate and its own worker.
 make_meta "$H" sm1 kind=secondmate "home=$H2" "$(placement sm1 w1 w1:t4 w1:p4)"
 make_record "$H" sm1 "$S_SM" "$H2" w1:p4 '["claude","--model","sonnet","Read AGENTS.md"]' \

@@ -17,7 +17,7 @@ It adds one Claude `SessionStart` hook that records each session id, plus a comm
   The record holds the exact session id from Claude itself, so there is no guessing from transcript folders or timestamps.
   The recorded cwd is the home root: a session that reports a subfolder of its firstmate home (say, a project clone it is reading) is recorded at that home's root, because Claude only loads a home's `.claude/` hooks, commands and skills from there.
   A cwd outside every home, such as a task's own worktree, is recorded as reported.
-  It also holds the cwd, the Herdr session, workspace, tab and pane, the exact launch argv read from `/proc`, an allowlisted set of launch variables (`FM_*`, `GIT_CONFIG_*`, `COMPACT_ADVISER_DISABLE`, `LAVISH_AXI_HOST`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_*` and `DISABLE_AUTOUPDATER`, minus anything that looks like a credential), and the last 10 session ids the record named before.
+  It also holds the cwd, the Herdr session, workspace, tab and pane, the exact launch argv read from `/proc`, the session's whole launch environment minus credential-like names (see [The launch environment](#the-launch-environment)), and the last 10 session ids the record named before.
   A session that Claude's daemon hosts in the background (`claude daemon`, whose tree is `claude bg-pty-host ... -- <claude binary> ...`) is recorded as the session itself: the nearest `claude` ancestor, which may be the versioned binary `.../claude/versions/<x.y.z>`, and never the `bg-pty-host` wrapper.
   Its recorded argv names plain `claude`, so the record survives a Claude update.
   Such a session has no `HERDR_*` variables, so its record has no pane; `fcr resume` then reports it `skip` with the command to run by hand.
@@ -25,7 +25,7 @@ It adds one Claude `SessionStart` hook that records each session id, plus a comm
   It ignores `claude -p` runs and Claude processes started from inside another Claude session (`CLAUDECODE=1`), so a helper never overwrites its task's record.
 - **Resume.** `fcr resume` walks a firstmate home and every second mate home it records.
   For each Claude task it reports one of three outcomes: `alive` (a live interactive `claude`, including a daemon-hosted background session, already runs that session or task, so nothing is doubled), `resumed`, or `skip` with the reason.
-  Each session restarts in its recorded folder (a record that holds a subfolder of a walked home, written before the recorder fixed this, restarts at that home's root) with its recorded argv and variables.
+  Each session restarts in its recorded folder (a record that holds a subfolder of a walked home, written before the recorder fixed this, restarts at that home's root) with its recorded argv and environment.
   The original prompt and any old `--resume`, `--session-id`, `--continue` or `--fork-session` are dropped, and `--resume <id>` is added.
   A session that was working when it stopped, or was idle but waiting on a background job of its own, also gets a short restart note as its first message; a plainly idle one comes back without it and waits (see [The restart note](#the-restart-note)).
   The recorded pane is reused when it still exists and holds only a shell.
@@ -72,6 +72,34 @@ To cover a fleet that is already running, restart its sessions (or wait for its 
    Running it twice is safe: anything already running is reported `alive` and left alone.
 
 The primary is included only when `<home>/bin/fm-lock.sh status` reports no live owner, and it is resumed last, after everything it supervises is running again.
+
+### The launch environment
+
+A session comes back with the environment it was launched with, so the recorder keeps every variable of the `claude` process except two kinds of name:
+
+- **Credentials.** A name that matches the denylist is never written, so a secret never reaches a record; the record lists only the *names* it withheld (`env_withheld`).
+  The denylist matches the variable name, case-insensitively, against any of: `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`, `API_KEY` / `APIKEY`, `ACCESS_KEY`, `PRIVATE_KEY`, `SIGNING_KEY`, `CREDENTIAL`, `BEARER`, `COOKIE`, `AUTH` or `AUTHORIZATION` as a whole word (so `SSH_AUTH_SOCK`, not `GIT_AUTHOR_NAME`), a name ending in `_KEY`, `_PAT` or `_PW`, `DSN`, `CONNECTION_STRING`, and `DATABASE_URL`, `REDIS_URL` and the like.
+  Only the name is looked at, never the value, so a secret inside a variable with an innocent name is not caught: add that name (below).
+- **Pane and process names**, which belong to the pane the session comes back in, not to its launch: `HERDR_*`, `PWD`, `OLDPWD`, `SHLVL`, `_`, `SHELLOPTS`, `BASHOPTS`, `CLAUDECODE`, and Claude's own per-process `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_*`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH` and `CLAUDE_CODE_SSE_PORT`.
+
+On resume the launcher unsets every variable the pane shell inherited, except those pane names and the withheld credential names, then exports the recorded ones.
+So the session gets exactly what it had, nothing the pane shell happened to have that it did not, and a credential comes from the pane shell's own environment (your profile) if the pane has it, since fcr never stored it.
+A variable that holds something tied to the old boot, such as a socket path, is restored as recorded; add its name to the denylist to take the pane's value instead.
+
+To add names, list extended regular expressions, one per line, in `${XDG_CONFIG_HOME:-~/.config}/fcr/env-deny` (blank lines and `#` comments are ignored; `FCR_ENV_DENY_FILE` names another file):
+
+```sh
+mkdir -p ~/.config/fcr
+cat >> ~/.config/fcr/env-deny <<'EOF'
+# matched against the variable name, case-insensitively
+^CORP_
+INTERNAL_(ID|HASH)$
+EOF
+```
+
+They apply to sessions recorded after the change, and add to the built-in list; a malformed line falls back to the built-in list alone.
+To change the built-in list itself, edit `FCR_ENV_DENY` in `fcr-session-hook`.
+A record from before this change holds only the older allowlisted variables (`FM_*`, `GIT_CONFIG_*`, `COMPACT_ADVISER_DISABLE`, `LAVISH_AXI_HOST`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_*`, `DISABLE_AUTOUPDATER`), and resume treats it as before until the session is recorded again.
 
 ### The restart note
 

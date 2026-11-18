@@ -16,6 +16,13 @@
 # The record is one JSON object (format version 1) written atomically (temp
 # file plus rename), so it always names the current session id.
 #
+# The recorded cwd is where `fcr resume` relaunches the session, and Claude only
+# loads a home's .claude/ config (hooks, commands, skills) from the home root. A
+# session can report a subfolder of its home (say, a project clone it is reading),
+# so when the reported cwd sits inside a firstmate home it is recorded as that
+# home's root instead (the nearest ancestor with bin/fm-lock.sh and bin/fm-spawn.sh).
+# A cwd outside any home, such as a task worktree, is recorded as reported.
+#
 # What it records: the session id, cwd, source event, transcript path, the
 # Herdr session/workspace/tab/pane from the HERDR_* variables, a capture time,
 # the exact launch argv of the owning `claude` process (read from /proc by
@@ -80,8 +87,24 @@ fcr_hook_find_claude() {
   return 1
 }
 
+# fcr_hook_home_root <dir>: print the nearest firstmate home root at or above
+# <dir> (a directory holding bin/fm-lock.sh and bin/fm-spawn.sh), or fail.
+fcr_hook_home_root() {
+  local d=$1
+  while [ -n "$d" ]; do
+    if [ -f "$d/bin/fm-lock.sh" ] && [ -f "$d/bin/fm-spawn.sh" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+    [ "$d" != / ] || break
+    d=${d%/*}
+    [ -n "$d" ] || d=/
+  done
+  return 1
+}
+
 fcr_hook_main() {
-  local input='' session_id cwd source transcript inbox state task_id target kind
+  local input='' session_id cwd source transcript inbox state task_id target kind root
   local claude_pid argv_json env_json herdr_session tmp now_iso now_epoch previous
 
   IFS= read -r -d '' -t 5 input || true
@@ -104,6 +127,10 @@ fcr_hook_main() {
     if [ -z "$task_id" ] || [ ! -d "$state" ]; then fcr_hook_debug "skip: no state dir for $inbox"; return 0; fi
     target="$state/$task_id.claude-session"
     kind=task
+    if root=$(fcr_hook_home_root "${cwd%/}") && [ "$root" != "${cwd%/}" ]; then
+      fcr_hook_debug "cwd $cwd is inside the firstmate home $root; recording the home root"
+      cwd=$root
+    fi
   elif [ -f "$cwd/bin/fm-lock.sh" ] && [ -f "$cwd/bin/fm-spawn.sh" ]; then
     state="$cwd/state"
     task_id=''

@@ -204,6 +204,24 @@ assert_contains "primary resumed in its recorded pane" "resumed       primary   
 assert_eq "--only touched nothing else" "$((runs_before + 1))" "$(wc -l <"$FAKE_HERDR_DIR/runs.log")"
 assert_eq "primary relaunched in the home root" "\"$H\"" "$(launched "$S_PRI" .cwd)"
 
+# --- a recorded subfolder of a home resumes at the home root ---------------------------
+# Older records hold whatever cwd the session reported, such as a project clone
+# under its home; claude only loads a home's .claude/ config from the home root.
+S_SUB=$(new_uuid) S_SUB2=$(new_uuid)
+make_meta "$H" t-sub "$(placement t-sub w7 w7:t1 w7:p1)"
+make_record "$H" t-sub "$S_SUB" "$H/projects/clone/src/" w7:p1 '["claude","go"]'
+make_meta "$H" t-sub2 "$(placement t-sub2 w7 w7:t1 w7:p1)"
+make_record "$H" t-sub2 "$S_SUB2" "$H2/projects/clone" w7:p1 '["claude","go"]'
+out=$("$FCR" resume --home "$H" --dry-run --only t-sub 2>&1)
+assert_contains "dry run plans the home root, not the recorded subfolder" "cwd $H;" "$out"
+out=$("$FCR" resume --home "$H" --only t-sub 2>&1)
+assert_eq "subfolder of the home: resume exits 0" 0 "$?"
+assert_eq "subfolder of the home: relaunched in the home root" "\"$H\"" "$(launched "$S_SUB" .cwd)"
+out=$("$FCR" resume --home "$H" --only t-sub2 2>&1)
+assert_eq "subfolder of a second mate's home: resume exits 0" 0 "$?"
+assert_eq "subfolder of a second mate's home: relaunched in that home's root" "\"$H2\"" "$(launched "$S_SUB2" .cwd)"
+assert_eq "a task worktree outside every home is still relaunched where it was recorded" "\"$(wt t-reuse)\"" "$(launched "$S_REUSE" .cwd)"
+
 # --- failures ---------------------------------------------------------------------------
 S_FAIL=$(new_uuid)
 make_meta "$H" t-fail "$(placement t-fail w1 w1:t2 w1:p2)"

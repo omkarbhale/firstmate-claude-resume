@@ -406,6 +406,31 @@ fcr_walk_home() {
   done
 }
 
+# fcr_home_root <dir>: if <dir> is inside one of the walked firstmate homes
+# (FCR_HOMES) but is not its root, print that home's root; otherwise print <dir>.
+# A session record can hold a subfolder of its home (an older fcr-session-hook
+# stored whatever cwd the session reported), and Claude only loads a home's
+# .claude/ config from the home root. A folder outside every walked home, such
+# as a task worktree, is left alone.
+fcr_home_root() {
+  local dir=${1%/} d h real
+  [ -n "$dir" ] || { printf '%s' "$1"; return 0; }
+  d=$dir
+  while [ -n "$d" ]; do
+    if [ -f "$d/bin/fm-lock.sh" ] && [ -f "$d/bin/fm-spawn.sh" ]; then
+      real=$(cd "$d" 2>/dev/null && pwd -P) || break
+      for h in ${FCR_HOMES[@]+"${FCR_HOMES[@]}"}; do
+        if [ "$(cd "$h" 2>/dev/null && pwd -P)" = "$real" ]; then printf '%s' "$d"; return 0; fi
+      done
+      break
+    fi
+    [ "$d" != / ] || break
+    d=${d%/*}
+    [ -n "$d" ] || d=/
+  done
+  printf '%s' "$dir"
+}
+
 fcr_lock_status() {  # <home>
   local home=$1
   [ -x "$home/bin/fm-lock.sh" ] || { printf 'unknown (no bin/fm-lock.sh)'; return 0; }
@@ -663,7 +688,7 @@ fcr_resume() {
       fcr_say alive "$label" "claude pid $pid already running (session $sid)"
       alive=$((alive + 1)); continue
     fi
-    cwd=$(printf '%s' "$rec" | jq -r '.cwd // empty')
+    cwd=$(fcr_home_root "$(printf '%s' "$rec" | jq -r '.cwd // empty')")
     transcript=$(printf '%s' "$rec" | jq -r '.transcript_path // empty')
     reason=''
     if [ -n "$meta" ] && [ "$(fcr_meta_get "$meta" backend)" != herdr ]; then
@@ -706,7 +731,7 @@ fcr_resume() {
     label=${T_LABEL[i]} kind=${T_KIND[i]} meta=${T_META[i]} record=${T_RECORD[i]} inbox=${T_INBOX[i]}
     rec=$(jq -c . "$record")
     sid=$(printf '%s' "$rec" | jq -r '.session_id')
-    cwd=$(printf '%s' "$rec" | jq -r '.cwd')
+    cwd=$(fcr_home_root "$(printf '%s' "$rec" | jq -r '.cwd')")
     session='' ws='' tab='' pane=''
     if [ -n "$meta" ]; then
       session=$(fcr_meta_get "$meta" herdr_session)

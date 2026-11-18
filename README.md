@@ -15,12 +15,14 @@ It adds one Claude `SessionStart` hook that records each session id, plus a comm
   For a firstmate worker or second mate, which firstmate launches with `FM_TASK_INBOX=<home>/state/<task-id>.inbox`, it writes `<home>/state/<task-id>.claude-session` next to the task's own record.
   For the primary firstmate session, started in a firstmate home root, it writes `<home>/state/.primary-claude-session`.
   The record holds the exact session id from Claude itself, so there is no guessing from transcript folders or timestamps.
+  The recorded cwd is the home root: a session that reports a subfolder of its firstmate home (say, a project clone it is reading) is recorded at that home's root, because Claude only loads a home's `.claude/` hooks, commands and skills from there.
+  A cwd outside every home, such as a task's own worktree, is recorded as reported.
   It also holds the cwd, the Herdr session, workspace, tab and pane, the exact launch argv read from `/proc`, an allowlisted set of launch variables (`FM_*`, `GIT_CONFIG_*`, `COMPACT_ADVISER_DISABLE`, `LAVISH_AXI_HOST`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_*` and `DISABLE_AUTOUPDATER`, minus anything that looks like a credential), and the last 10 session ids the record named before.
   It is silent, makes no network calls and always exits 0, so it can never break or slow a session.
   It ignores `claude -p` runs and Claude processes started from inside another Claude session (`CLAUDECODE=1`), so a helper never overwrites its task's record.
 - **Resume.** `fcr resume` walks a firstmate home and every second mate home it records.
   For each Claude task it reports one of three outcomes: `alive` (a live interactive `claude` already runs that session or task, so nothing is doubled), `resumed`, or `skip` with the reason.
-  Each session restarts in its recorded folder with its recorded argv and variables.
+  Each session restarts in its recorded folder (a record that holds a subfolder of a walked home, written before the recorder fixed this, restarts at that home's root) with its recorded argv and variables.
   The original prompt and any old `--resume`, `--session-id`, `--continue` or `--fork-session` are dropped, and `--resume <id>` is added.
   A session that was working when it stopped also gets a short restart note as its first message; one that was idle comes back without it and waits (see [The restart note](#the-restart-note)).
   The recorded pane is reused when it still exists and holds only a shell.

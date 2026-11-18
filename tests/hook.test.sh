@@ -67,6 +67,22 @@ sid3=$(new_uuid)
 (cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" FAKE_CLAUDE_CHILD=1 FAKE_CLAUDE_SESSION_ID="$sid3" claude --model sonnet 'x')
 assert_eq "the parent of a nested claude still records itself" "$sid3" "$(jq -r .session_id "$record")"
 
+# --- the recorded cwd is the home root, not a subfolder of it --------------------------
+sub="$home/projects/clone/src"
+mkdir -p "$sub"
+sid_sub=$(new_uuid)
+(cd "$sub" && FM_TASK_INBOX="$home/state/t1.inbox" FAKE_CLAUDE_SESSION_ID="$sid_sub" claude --model sonnet 'x')
+assert_eq "a task session reporting a subfolder of its home records the home root" "$home" "$(jq -r .cwd "$record")"
+assert_eq "the record is for that session" "$sid_sub" "$(jq -r .session_id "$record")"
+# A secondmate's own home is a separate tree from the state dir its inbox is in.
+smhome="$TEST_TMP/fm-sm"
+make_home "$smhome"
+mkdir -p "$smhome/projects/clone"
+(cd "$smhome/projects/clone" && FM_TASK_INBOX="$home/state/t1.inbox" claude --model sonnet 'x')
+assert_eq "a secondmate in a subfolder of its own home records that home root" "$smhome" "$(jq -r .cwd "$record")"
+(cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" claude --model sonnet 'x')
+assert_eq "a task worktree outside any home keeps its reported cwd" "$wt" "$(jq -r .cwd "$record")"
+
 # --- primary --------------------------------------------------------------------
 psid=$(new_uuid)
 (cd "$home" && HERDR_SOCKET_PATH="$HOME/.config/herdr/sessions/fm-lab-x/herdr.sock" HERDR_PANE_ID=w1:p1 \

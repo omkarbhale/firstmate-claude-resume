@@ -26,10 +26,17 @@
 # What it records: the session id, cwd, source event, transcript path, the
 # Herdr session/workspace/tab/pane from the HERDR_* variables, a capture time,
 # the exact launch argv of the owning `claude` process (read from /proc by
-# walking this hook's ancestry, never reconstructed), an allowlisted slice of
-# that process's launch environment (FCR_ENV_ALLOW below; names that look like
-# credentials are dropped even when allowlisted, FCR_ENV_DENY), and
-# previous_sessions: the last 10 ids the record named before, newest first.
+# walking this hook's ancestry, never reconstructed), that process's whole
+# launch environment except two kinds of names, and previous_sessions: the last
+# 10 ids the record named before, newest first. The two kinds of names:
+#   - credential-like names (FCR_ENV_DENY below, plus the patterns in the
+#     optional extra file, see fcr_env_deny_extra): never written, so a secret
+#     never reaches a record. Their names, never their values, go in
+#     env_withheld, so `fcr resume` leaves the pane shell's own copy alone.
+#   - names that describe the process or pane, not the launch (FCR_ENV_SKIP):
+#     the resumed pane supplies its own.
+# env_scope "full" marks a record that holds the whole environment, as opposed
+# to the older allowlisted one.
 #
 # It skips `--print` sessions and nested Claude processes, so a child can never
 # overwrite its parent task's record. A nested claude is one whose own launch
@@ -43,12 +50,43 @@
 # Set FCR_HOOK_DEBUG=<file> to append a one-line reason when it records or skips.
 set -u
 
-FCR_ENV_ALLOW='^(FM_[A-Za-z0-9_]*|GIT_CONFIG_[A-Za-z0-9_]*|COMPACT_ADVISER_DISABLE|LAVISH_AXI_HOST|CLAUDE_CONFIG_DIR|CLAUDE_CODE_[A-Za-z0-9_]*|DISABLE_AUTOUPDATER)$'
-FCR_ENV_DENY='(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|AUTH|COOKIE|^CLAUDE_CODE_(SESSION_ID|MESSAGING_.*|CHILD_SESSION|ENTRYPOINT|EXECPATH|SSE_PORT)$)'
+# Names whose values are credentials, matched case-insensitively against the
+# variable NAME (never the value). To add more without editing this file, list
+# extended regular expressions, one per line, in the file named by
+# FCR_ENV_DENY_FILE (default ${XDG_CONFIG_HOME:-~/.config}/fcr/env-deny).
+FCR_ENV_DENY='(TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|SIGNING_?KEY|CREDENTIAL|BEARER|COOKIE|(^|_)AUTH(ORIZATION)?(_|$)|(^|_)KEY$|(^|_)PAT$|(^|_)PW$|(^|_)(DSN|(DATABASE|DB|REDIS|MONGO(DB)?|POSTGRES(QL)?|MYSQL|AMQP)_URL|CONNECTION_STRING)$)'
+# Names that belong to the process or the pane, not to the launch. Keep this in
+# step with the names `fcr resume` always leaves alone (fcr_write_launcher).
+FCR_ENV_SKIP='^(HERDR_[A-Za-z0-9_]*|PWD|OLDPWD|SHLVL|_|SHELLOPTS|BASHOPTS|CLAUDECODE|CLAUDE_CODE_(SESSION_ID|MESSAGING_[A-Za-z0-9_]*|CHILD_SESSION|ENTRYPOINT|EXECPATH|SSE_PORT))$'
 
 fcr_hook_debug() {
   [ -n "${FCR_HOOK_DEBUG:-}" ] || return 0
   printf '%s fcr-session-hook: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$FCR_HOOK_DEBUG" 2>/dev/null || true
+}
+
+# fcr_hook_deny_pattern: the credential name pattern, the built-in one plus
+# every line of the optional extra file (blank lines and # comments ignored).
+fcr_hook_deny_pattern() {
+  local file=${FCR_ENV_DENY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/fcr/env-deny} line pat=$FCR_ENV_DENY
+  if [ -f "$file" ] && [ -r "$file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line%$'\r'}
+      [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+      pat+="|($line)"
+    done <"$file"
+  fi
+  printf '%s' "$pat"
+}
+
+# fcr_hook_env_json <pid> <deny-pattern>: {env: {...}, withheld: [names]}
+fcr_hook_env_json() {
+  jq -Rs --arg skip "$FCR_ENV_SKIP" --arg deny "$2" '
+    split("\u0000")
+    | map(select(test("\\A[A-Za-z_][A-Za-z0-9_]*=")) | (index("=") as $i | {key: .[:$i], value: .[$i + 1:]}))
+    | map(select(.key | test($skip) | not))
+    | { env: (map(select((.key | test($deny; "i")) | not)) | from_entries),
+        withheld: (map(select(.key | test($deny; "i")) | .key) | unique) }
+  ' <"/proc/$1/environ" 2>/dev/null
 }
 
 # fcr_hook_is_claude <pid>: the process is a Claude Code CLI, by kernel name or
@@ -114,7 +152,7 @@ fcr_hook_home_root() {
 
 fcr_hook_main() {
   local input='' session_id cwd source transcript inbox state task_id target kind root
-  local claude_pid argv_json env_json herdr_session tmp now_iso now_epoch previous
+  local claude_pid argv_json env_rec env_json withheld_json herdr_session tmp now_iso now_epoch previous
 
   IFS= read -r -d '' -t 5 input || true
   [ -n "$input" ] || { fcr_hook_debug "skip: empty stdin"; return 0; }
@@ -178,12 +216,14 @@ fcr_hook_main() {
     fcr_hook_debug "skip: nested claude $claude_pid (CLAUDECODE=1 in its launch environment)"
     return 0
   fi
-  env_json=$(jq -Rs --arg allow "$FCR_ENV_ALLOW" --arg deny "$FCR_ENV_DENY" '
-    split("\u0000")
-    | map(select(test("^[A-Za-z_][A-Za-z0-9_]*=")) | capture("^(?<key>[^=]+)=(?<value>.*)$"; "s"))
-    | map(select((.key | test($allow)) and ((.key | test($deny; "i")) | not)))
-    | from_entries
-  ' <"/proc/$claude_pid/environ" 2>/dev/null) || env_json='{}'
+  # A malformed line in the extra file must not lose the whole environment:
+  # fall back to the built-in pattern alone.
+  env_rec=$(fcr_hook_env_json "$claude_pid" "$(fcr_hook_deny_pattern)") || {
+    fcr_hook_debug "warn: bad pattern in the env deny file, using the built-in one"
+    env_rec=$(fcr_hook_env_json "$claude_pid" "$FCR_ENV_DENY") || env_rec='{"env":{},"withheld":[]}'
+  }
+  env_json=$(printf '%s' "$env_rec" | jq -c '.env') || env_json='{}'
+  withheld_json=$(printf '%s' "$env_rec" | jq -c '.withheld') || withheld_json='[]'
 
   herdr_session=${HERDR_SESSION:-}
   if [ -z "$herdr_session" ] && [ -n "${HERDR_SOCKET_PATH:-}" ]; then
@@ -219,13 +259,14 @@ fcr_hook_main() {
       --arg hs "$herdr_session" --arg hw "${HERDR_WORKSPACE_ID:-}" \
       --arg ht "${HERDR_TAB_ID:-}" --arg hp "${HERDR_PANE_ID:-}" \
       --argjson claude_pid "$claude_pid" --argjson argv "$argv_json" --argjson env "$env_json" \
-      --argjson previous "$previous" '
+      --argjson withheld "$withheld_json" --argjson previous "$previous" '
       {
         format: 1, kind: $kind, task_id: $task_id, state_dir: $state_dir,
         session_id: $session_id, source: $source, cwd: $cwd, transcript_path: $transcript,
         captured_at: $captured_at, captured_epoch: $captured_epoch,
         herdr: {session: $hs, workspace_id: $hw, tab_id: $ht, pane_id: $hp},
-        claude_pid: $claude_pid, argv: $argv, env: $env, previous_sessions: $previous
+        claude_pid: $claude_pid, argv: $argv, env: $env, env_scope: "full", env_withheld: $withheld,
+        previous_sessions: $previous
       }' >"$tmp"
   ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; fcr_hook_debug "error: could not write $tmp"; return 0; }
   mv -f "$tmp" "$target" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; fcr_hook_debug "error: could not write $target"; return 0; }

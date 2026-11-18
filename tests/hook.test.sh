@@ -38,10 +38,19 @@ check "record has a capture timestamp" jq -e '.captured_at | test("^[0-9]{4}-[0-
 expected_argv=$(jq -cn --arg c "$TEST_TMP/bin/claude" '[$c, "--dangerously-skip-permissions", "--settings", "{\"a\":{\"b\":\"c d\"}}",
   "--model", "sonnet", "--append-system-prompt", "multi\nline prompt", "the original prompt"]')
 assert_eq "record argv is the exact launch argv from /proc" "$expected_argv" "$(jq -c .argv "$record")"
-assert_eq "record env keeps exactly the allowlisted names" \
-  "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION CLAUDE_CONFIG_DIR COMPACT_ADVISER_DISABLE DISABLE_AUTOUPDATER FM_TASK_ID FM_TASK_INBOX GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 LAVISH_AXI_HOST" \
-  "$(jq -r '.env | keys | join(" ")' "$record")"
+assert_eq "record env is the whole launch environment, marked full" full "$(jq -r .env_scope "$record")"
+assert_eq "record env keeps the launch variables, including ones outside any allowlist" \
+  "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION CLAUDE_CONFIG_DIR COMPACT_ADVISER_DISABLE DISABLE_AUTOUPDATER FM_TASK_ID FM_TASK_INBOX GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 LAVISH_AXI_HOST OTHER_VAR" \
+  "$(jq -r '.env | keys | map(select(test("^(CLAUDE_|COMPACT_|DISABLE_|FM_|GIT_CONFIG_|LAVISH_|OTHER_)"))) | join(" ")' "$record")"
+assert_eq "record env has the ordinary session environment too" "$PATH|$HOME|nope" \
+  "$(jq -r '"\(.env.PATH)|\(.env.HOME)|\(.env.OTHER_VAR)"' "$record")"
 assert_eq "record env values" "/hooks|$HOME/.claude-alt" "$(jq -r '"\(.env.GIT_CONFIG_VALUE_0)|\(.env.CLAUDE_CONFIG_DIR)"' "$record")"
+assert_eq "pane and process names are not recorded" "" \
+  "$(jq -r '.env | keys[] | select(test("^(HERDR_|PWD$|OLDPWD$|SHLVL$|_$|CLAUDECODE$)"))' "$record")"
+assert_eq "credential-like names are withheld, and only their names are kept" \
+  "ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN FM_GITHUB_TOKEN" "$(jq -r '.env_withheld | join(" ")' "$record")"
+assert_eq "no credential-like name is in the recorded env" "" \
+  "$(jq -r '.env | keys[] | select(test("TOKEN|API_KEY"))' "$record")"
 assert_not_contains "no secret value is recorded" secret "$(cat "$record")"
 check "no temp file is left behind" bash -c "! ls -A '$home/state' | grep -q tmp"
 assert_eq "record is private" 600 "$(stat -c %a "$record")"
@@ -82,6 +91,48 @@ mkdir -p "$smhome/projects/clone"
 assert_eq "a secondmate in a subfolder of its own home records that home root" "$smhome" "$(jq -r .cwd "$record")"
 (cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" claude --model sonnet 'x')
 assert_eq "a task worktree outside any home keeps its reported cwd" "$wt" "$(jq -r .cwd "$record")"
+
+# --- the credential denylist ----------------------------------------------------
+# Every name below is credential-like and must never reach the record; every
+# name in the second group looks close but is an ordinary setting and is kept.
+deny_names='GITHUB_TOKEN NPM_TOKEN AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID DB_PASSWORD PGPASSWD GPG_PASSPHRASE
+  OPENAI_API_KEY STRIPE_APIKEY GOOGLE_PRIVATE_KEY SIGNING_KEY MY_CREDENTIALS BEARER_VALUE SESSION_COOKIE
+  SSH_AUTH_SOCK HTTP_AUTHORIZATION DEPLOY_KEY GITLAB_PAT DB_PW SENTRY_DSN DATABASE_URL REDIS_URL
+  lowercase_secret'
+keep_names='GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME KEYBOARD_LAYOUT GIT_CONFIG_KEY_0 AUTHORS_FILE
+  MONKEY_PATH PATCH_LEVEL EDITOR LANG TERM SOME_URL'
+deny_env=()
+for n in $deny_names; do deny_env+=("$n=hunter2"); done
+keep_env=()
+for n in $keep_names; do keep_env+=("$n=plain"); done
+(cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" env "${deny_env[@]}" "${keep_env[@]}" claude --model sonnet 'x')
+leaked=$(jq -r --arg names "$deny_names" '.env | keys[] as $k | select(($names | split(" ") | map(select(. != "")) | index($k)) != null) | $k' "$record")
+assert_eq "no credential-like name is recorded" "" "$leaked"
+assert_not_contains "no credential value is recorded" hunter2 "$(cat "$record")"
+missing=''
+for n in $keep_names; do jq -e --arg n "$n" '.env | has($n)' "$record" >/dev/null || missing+=" $n"; done
+assert_eq "close-looking ordinary names are still recorded" "" "$missing"
+withheld_missing=''
+for n in $deny_names; do jq -e --arg n "$n" '.env_withheld | index($n)' "$record" >/dev/null || withheld_missing+=" $n"; done
+assert_eq "each withheld credential name is listed (names only)" "" "$withheld_missing"
+
+# The extra denylist file: one extended regex per line, # comments and blanks ignored.
+mkdir -p "$HOME/.config/fcr"
+printf '# my own secrets\n\n^CORP_\n  \nINTERNAL_(ID|HASH)$\n' >"$HOME/.config/fcr/env-deny"
+(cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" CORP_THING=x corp_lower=x INTERNAL_ID=1 INTERNAL_HASH=2 INTERNAL_OTHER=3 claude --model sonnet 'x')
+assert_eq "names matching the extra denylist are not recorded" "INTERNAL_OTHER" \
+  "$(jq -r '.env | keys[] | select(test("^(CORP_|corp_|INTERNAL_)"))' "$record")"
+assert_eq "extra-denylist names are listed as withheld" "CORP_THING INTERNAL_HASH INTERNAL_ID" \
+  "$(jq -r '.env_withheld | map(select(test("^(CORP_|INTERNAL_)"))) | join(" ")' "$record")"
+assert_eq "the built-in denylist still applies with an extra file" "" "$(jq -r '.env | keys[] | select(test("TOKEN"))' "$record")"
+printf '(unbalanced\n' >"$HOME/.config/fcr/env-deny"
+(cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" GITHUB_TOKEN=hunter2 KEEP_ME=1 claude --model sonnet 'x')
+assert_eq "a malformed extra pattern falls back to the built-in denylist, not an empty env" "1|" \
+  "$(jq -r '"\(.env.KEEP_ME)|\(.env.GITHUB_TOKEN // "")"' "$record")"
+rm -f "$HOME/.config/fcr/env-deny"
+printf '^FROM_FILE_VAR$\n' >"$TEST_TMP/alt-deny"
+(cd "$wt" && FM_TASK_INBOX="$home/state/t1.inbox" FCR_ENV_DENY_FILE="$TEST_TMP/alt-deny" FROM_FILE_VAR=1 claude --model sonnet 'x')
+assert_eq "FCR_ENV_DENY_FILE names the extra file" "" "$(jq -r '.env | keys[] | select(. == "FROM_FILE_VAR")' "$record")"
 
 # --- primary --------------------------------------------------------------------
 psid=$(new_uuid)

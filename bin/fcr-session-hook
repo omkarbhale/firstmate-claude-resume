@@ -52,13 +52,22 @@ fcr_hook_debug() {
 }
 
 # fcr_hook_is_claude <pid>: the process is a Claude Code CLI, by kernel name or
-# argv[0] (a shebang-script claude shows its own name as comm).
+# argv[0] (a shebang-script claude shows its own name as comm). Claude Code's
+# installer keeps each release at <share>/claude/versions/<x.y.z>, and a session
+# the `claude daemon` hosts (a background session) runs that versioned binary
+# directly, so its comm and argv[0] are the version, not "claude". The wrapper
+# around it (`claude bg-pty-host ... -- <session command>`) is named claude, so
+# the nearest match going up from the hook must be the session, not the wrapper.
 fcr_hook_is_claude() {
-  local pid=$1 comm argv0
+  local pid=$1 comm argv0 argv1=''
   read -r comm <"/proc/$pid/comm" 2>/dev/null || return 1
   [ "$comm" = claude ] && return 0
-  IFS= read -r -d '' argv0 <"/proc/$pid/cmdline" 2>/dev/null || [ -n "${argv0:-}" ] || return 1
-  [ "${argv0##*/}" = claude ]
+  { IFS= read -r -d '' argv0 && IFS= read -r -d '' argv1; } <"/proc/$pid/cmdline" 2>/dev/null || [ -n "${argv0:-}" ] || return 1
+  [ "${argv0##*/}" = claude ] && return 0
+  # argv1: the same binary run as a shebang script ("<interpreter> <path> ...").
+  case "$argv0" in */claude/versions/[0-9]*) return 0 ;; esac
+  case "$argv1" in */claude/versions/[0-9]*) return 0 ;; esac
+  return 1
 }
 
 fcr_hook_ppid() {
@@ -149,8 +158,17 @@ fcr_hook_main() {
     split("\u0000") | if .[-1] == "" then .[:-1] else . end
     # A shebang-script claude runs as "<interpreter> <path>/claude args...";
     # record the claude invocation itself.
-    | if (.[0] | split("/") | last) != "claude" and ((.[1] // "") | split("/") | last) == "claude"
+    | if ((.[0] // "") | split("/") | last) != "claude" and ((.[1] // "") | split("/") | last) == "claude"
       then .[1:] else . end
+    # A background session'"'"'s wrapper: `claude bg-pty-host ... -- <command...>`.
+    # The command after "--" is the session itself.
+    | if ((.[0] // "") | split("/") | last) == "claude" and .[1] == "bg-pty-host" and (index("--") != null)
+      then .[(index("--") + 1):] else . end
+    # A versioned binary (<share>/claude/versions/<x.y.z>), run directly or as a
+    # script, becomes plain "claude", so the record survives a Claude update.
+    | if ((.[0] // "") | test("/claude/versions/[0-9][^/]*$")) then .[0] = "claude"
+      elif ((.[1] // "") | test("/claude/versions/[0-9][^/]*$")) and (((.[0] // "") | split("/") | last) | test("^(ba|da|z)?sh$|^env$"))
+      then .[1:] | .[0] = "claude" else . end
   ' <"/proc/$claude_pid/cmdline" 2>/dev/null) || return 0
   if printf '%s' "$argv_json" | jq -e 'any(.[]; . == "-p" or . == "--print")' >/dev/null 2>&1; then
     fcr_hook_debug "skip: --print session $session_id"

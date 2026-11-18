@@ -93,6 +93,40 @@ assert_eq "herdr session derived from the socket path" fm-lab-x "$(jq -r .herdr.
 (cd "$home" && HERDR_SOCKET_PATH="$HOME/.config/herdr/herdr.sock" HERDR_PANE_ID=w1:p1 claude)
 assert_eq "default socket path means the default session" default "$(jq -r .herdr.session "$home/state/.primary-claude-session")"
 
+# --- background-session primary (hosted by `claude daemon`) ---------------------
+# claude bg-pty-host ... -- <share>/claude/versions/<x.y.z> --session-id <id> ...
+# The session is the versioned binary, not the claude-named wrapper above it.
+share="$TEST_TMP/share/claude/versions"
+mkdir -p "$share"
+cp "$TEST_TMP/bin/claude" "$share/2.1.310"
+bgsid=$(new_uuid)
+rm -f "$home/state/.primary-claude-session"
+(cd "$home" && FAKE_CLAUDE_LOG="$TEST_TMP/bg.log" FAKE_CLAUDE_SESSION_ID="$bgsid" FM_HOME="$home" \
+  claude bg-pty-host --bg-pty-host "$TEST_TMP/bg.sock" 165 46 -- "$share/2.1.310" \
+  --session-id "$bgsid" --permission-mode bypassPermissions)
+bgrec="$home/state/.primary-claude-session"
+check "background primary: record written" test -f "$bgrec"
+assert_eq "background primary: session id" "$bgsid" "$(jq -r .session_id "$bgrec" 2>/dev/null)"
+assert_eq "background primary: argv is the session's, with the versioned binary named claude" \
+  "$(jq -cn --arg s "$bgsid" '["claude", "--session-id", $s, "--permission-mode", "bypassPermissions"]')" "$(jq -c .argv "$bgrec" 2>/dev/null)"
+assert_not_contains "background primary: the wrapper is not recorded" bg-pty-host "$(cat "$bgrec" 2>/dev/null)"
+# The stub logs each run's pid: the recorded one must be the session's.
+session_pid=$(jq -r --arg s "$bgsid" 'select(.argv | index("--session-id")) | select(.argv | index($s)) | .pid' "$TEST_TMP/bg.log" 2>/dev/null | head -n 1)
+assert_eq "background primary: claude_pid is the session, not the wrapper" "$session_pid" "$(jq -r .claude_pid "$bgrec" 2>/dev/null)"
+assert_eq "background primary: no pane recorded when the session has no HERDR_* variables" "" \
+  "$(jq -r .herdr.pane_id "$bgrec" 2>/dev/null)"
+
+# If the session process is not recognisable, the wrapper's command after "--"
+# is recorded instead of the wrapper.
+mkdir -p "$TEST_TMP/other"
+cp "$TEST_TMP/bin/claude" "$TEST_TMP/other/session"
+rm -f "$bgrec"
+(cd "$home" && FAKE_CLAUDE_SESSION_ID="$bgsid" claude bg-pty-host --bg-pty-host "$TEST_TMP/bg.sock" 165 46 -- \
+  "$TEST_TMP/other/session" --session-id "$bgsid" --permission-mode bypassPermissions)
+assert_eq "unrecognised session: the command after -- is recorded, not the wrapper" \
+  "$(jq -cn --arg c "$TEST_TMP/other/session" --arg s "$bgsid" '[$c, "--session-id", $s, "--permission-mode", "bypassPermissions"]')" \
+  "$(jq -c .argv "$bgrec" 2>/dev/null)"
+
 # --- not firstmate ----------------------------------------------------------------
 other="$TEST_TMP/elsewhere"
 mkdir -p "$other"

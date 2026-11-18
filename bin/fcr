@@ -264,15 +264,17 @@ fcr_turn_state() {
 # in argv>". One-shot `claude -p` helpers (firstmate's supervision host runs
 # them inside a task's environment) never count as the task's agent.
 fcr_live_claude_scan() {
-  local d pid comm argv0 inbox cwd ids uid
+  local d pid comm argv0 argv1 inbox cwd ids uid
   uid=$(id -u)
   for d in /proc/[0-9]*; do
     pid=${d#/proc/}
     [ -O "$d" ] || [ "$uid" = 0 ] || continue
     read -r comm <"$d/comm" 2>/dev/null || continue
-    argv0=''
-    IFS= read -r -d '' argv0 <"$d/cmdline" 2>/dev/null || true
-    [ "$comm" = claude ] || [ "${argv0##*/}" = claude ] || continue
+    argv0='' argv1=''
+    { IFS= read -r -d '' argv0 && IFS= read -r -d '' argv1; } <"$d/cmdline" 2>/dev/null || true
+    # Claude's own name, or its versioned binary (<share>/claude/versions/<x.y.z>),
+    # which a daemon-hosted background session runs (argv1: as a shebang script).
+    [ "$comm" = claude ] || [ "${argv0##*/}" = claude ] || case "$argv0 $argv1" in */claude/versions/[0-9]*) ;; *) continue ;; esac
     tr '\0' '\n' <"$d/cmdline" 2>/dev/null | grep -qx -e '-p' -e '--print' && continue
     inbox=$(tr '\0' '\n' <"$d/environ" 2>/dev/null | sed -n 's/^FM_TASK_INBOX=//p' | head -n 1)
     cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=''

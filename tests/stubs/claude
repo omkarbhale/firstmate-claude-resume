@@ -12,7 +12,19 @@
 # Like Claude Code, it gives the hook and any child CLAUDECODE=1.
 # $FAKE_CLAUDE_CHILD=1 makes it run one nested `claude -p` first, which runs
 # the hook too. Then it stays alive $FAKE_CLAUDE_SLEEP seconds (default 0).
+# `claude bg-pty-host <args...> -- <command...>` is the wrapper a Claude daemon
+# runs around a background session: it runs <command...> as its child and exits
+# with its status (a copy of this stub at <share>/claude/versions/<x.y.z> is
+# the session, named like the real versioned binary).
 set -u
+if [ "${1:-}" = bg-pty-host ]; then
+  shift
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+  shift
+  "$@" &
+  wait "$!"
+  exit $?
+fi
 sid=${FAKE_CLAUDE_SESSION_ID:-}
 source=startup
 prev=''

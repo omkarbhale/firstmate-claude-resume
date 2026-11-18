@@ -24,7 +24,7 @@ It adds one Claude `SessionStart` hook that records each session id, plus a comm
   For each Claude task it reports one of three outcomes: `alive` (a live interactive `claude` already runs that session or task, so nothing is doubled), `resumed`, or `skip` with the reason.
   Each session restarts in its recorded folder (a record that holds a subfolder of a walked home, written before the recorder fixed this, restarts at that home's root) with its recorded argv and variables.
   The original prompt and any old `--resume`, `--session-id`, `--continue` or `--fork-session` are dropped, and `--resume <id>` is added.
-  A session that was working when it stopped also gets a short restart note as its first message; one that was idle comes back without it and waits (see [The restart note](#the-restart-note)).
+  A session that was working when it stopped, or was idle but waiting on a background job of its own, also gets a short restart note as its first message; a plainly idle one comes back without it and waits (see [The restart note](#the-restart-note)).
   The recorded pane is reused when it still exists and holds only a shell.
   Otherwise fcr creates a new tab in the recorded workspace, or a new workspace if that is gone too, and rewrites only `window`, `herdr_workspace_id`, `herdr_tab_id` and `herdr_pane_id` in the task's meta, so firstmate supervises the new pane.
   Second mates are resumed before their own tasks, and the primary last.
@@ -73,24 +73,35 @@ The primary is included only when `<home>/bin/fm-lock.sh status` reports no live
 ### The restart note
 
 The restart note tells the agent that the restart killed its background jobs, monitors, Workflows, subagents and child processes, that it should check and resume them (a Workflow with `resumeFromRunId`), and carry on with its task.
-That sets the session moving, so by default it goes only to a session that was mid-turn when it stopped.
+That sets the session moving, so by default it goes only to a session that was mid-turn when it stopped, or that was idle but waiting on a background job of its own (the restart killed the job, so the session would otherwise wait for a notification that never comes).
 `fcr` reads that from the last entry of the main conversation in the session's transcript (subagent and meta entries are ignored, and a line cut off by the crash is skipped):
 
 | Last entry | State | Note |
 | --- | --- | --- |
 | An assistant message that did not end its turn (a pending tool call, or cut off mid-stream), or an API error | working | sent |
 | A tool result, or a prompt not yet answered | working | sent |
-| An assistant message that ended its turn (`end_turn` or `stop_sequence`) | idle | not sent |
-| `[Request interrupted by user]`, or the output of a slash command like `/model` | idle | not sent |
+| An assistant message that ended its turn (`end_turn` or `stop_sequence`), or the output of a slash command like `/model`, with a background job still running | idle, waiting | sent |
+| The same, with no background job running | idle | not sent |
+| `[Request interrupted by user]` | idle | not sent |
 | No conversation yet | idle | not sent |
 | No transcript recorded, or it cannot be read | unknown | not sent |
 
+A background job counts as running when the transcript records its start after the session's last startup or resume (a restart killed whatever ran before it) and records no end for it since:
+
+- a Bash command run in the background, or moved there by its timeout;
+- a Monitor (its intermediate `Monitor event` notifications do not end it);
+- a subagent launched asynchronously.
+
+A job has ended once a notification with a final status (`completed`, `failed`, `killed` or `stopped`) or a `TaskStop` result names it.
+A session the user interrupted is not treated as waiting, because the person stopped it on purpose.
+Workflows are not detected: a session waiting only on a Workflow is treated as plainly idle (use `--prompt` for it).
+
 When the state is unknown the session comes back without the note: a session set moving cannot be stopped after the fact, while a quiet one can be prompted at any time.
-Each `resumed` (or `would resume`) line ends with the choice and why, such as `no restart note (was idle)`.
+Each `resumed` (or `would resume`) line ends with the choice and why, such as `no restart note (was idle)` or `restart note (was idle, waiting on 2 background jobs)`.
 
 - `--no-prompt` sends the note to no session.
 - `--prompt` sends it to every resumed session, idle or unknown too.
-  Use it when an idle session was waiting on a background job of its own, which the restart killed, so it learns to restart it.
+  Use it for a session fcr could not tell was waiting, such as one idle on a Workflow.
 
 ### Closing the blank panes left over
 

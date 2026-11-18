@@ -30,6 +30,7 @@ while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(FM_|HERDR_
 export HOME="$TEST_TMP/home"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export XDG_STATE_HOME="$HOME/.local/state"
+export XDG_CONFIG_HOME="$HOME/.config"
 mkdir -p "$HOME" "$TEST_TMP/bin"
 cp "$ROOT/tests/stubs/claude" "$ROOT/tests/stubs/herdr" "$TEST_TMP/bin/"
 export PATH="$TEST_TMP/bin:$PATH"

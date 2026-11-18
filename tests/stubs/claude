@@ -4,7 +4,8 @@
 #
 # Every run appends one JSON line to $FAKE_CLAUDE_LOG: pid, cwd, argv and the
 # environment names FM_*, GIT_CONFIG_*, CLAUDE_*, COMPACT_ADVISER_DISABLE,
-# LAVISH_AXI_HOST and DISABLE_AUTOUPDATER with their values.
+# LAVISH_AXI_HOST and DISABLE_AUTOUPDATER with their values, and, when
+# $FAKE_CLAUDE_ENV_ALL=1, the whole environment under env_all.
 # When $FAKE_CLAUDE_HOOK names a hook, it is run like Claude's SessionStart
 # hook: event JSON on stdin with session_id (the --resume or --session-id
 # value, else $FAKE_CLAUDE_SESSION_ID, else a fresh id), cwd, source
@@ -38,6 +39,11 @@ if [ -n "${FAKE_CLAUDE_LOG:-}" ]; then
   jq -cn --argjson pid $$ --arg cwd "$PWD" '{pid: $pid, cwd: $cwd, argv: $ARGS.positional,
     env: (env | with_entries(select(.key | test("^(FM_|GIT_CONFIG_|CLAUDE_|COMPACT_ADVISER_DISABLE$|LAVISH_AXI_HOST$|DISABLE_AUTOUPDATER$)"))))}' \
     --args -- "$@" >>"$FAKE_CLAUDE_LOG"
+  if [ "${FAKE_CLAUDE_ENV_ALL:-0}" = 1 ]; then
+    # Rewrite the line just logged with the whole environment added.
+    all=$(jq -cn 'env') && last=$(tail -n 1 "$FAKE_CLAUDE_LOG") &&
+      { sed -i '$d' "$FAKE_CLAUDE_LOG"; jq -c --argjson all "$all" '. + {env_all: $all}' <<<"$last" >>"$FAKE_CLAUDE_LOG"; }
+  fi
 fi
 
 if [ "${FAKE_CLAUDE_CHILD:-0}" = 1 ]; then

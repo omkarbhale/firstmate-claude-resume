@@ -505,21 +505,37 @@ fcr_shell_join() {  # <args...>: one shell-quoted command line
   printf '%s' "${out# }"
 }
 
-# fcr_write_launcher <file> <cwd> <env-json> <argv...>
+# fcr_write_launcher <file> <cwd> <env-json> <scope> <withheld-json> <argv...>
+# The launcher gives the session the environment it was launched with. For a
+# record with scope "full" that is exactly the recorded variables, plus the
+# pane's own copy of what the recorder withheld (credentials) and of the names
+# that belong to the pane (HERDR_*, PWD and the like; keep in step with
+# FCR_ENV_SKIP in fcr-session-hook): everything else the pane shell inherited is
+# unset first, so it cannot stand in for something the session never had. An
+# older record holds only an allowlisted slice, so only those names are reset.
 fcr_write_launcher() {
-  local file=$1 cwd=$2 env_json=$3 tmp
-  shift 3
+  local file=$1 cwd=$2 env_json=$3 scope=$4 withheld=$5 tmp
+  shift 5
   tmp="$file.tmp.$$"
   {
     printf '#!/usr/bin/env bash\n'
     printf '# Written by fcr resume %s at %s. Safe to delete.\n' "$FCR_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'cd -- %q || exit 1\n' "$cwd"
-    # Start from a clean slate for every allowlisted name, so a value the pane
-    # shell inherited cannot stand in for one the session never had.
-    # shellcheck disable=SC2016 # Expanded by the launcher, not here.
-    printf 'while IFS= read -r fcr_v; do unset "$fcr_v"; done < <(compgen -e | grep -E %q)\n' \
-      '^(FM_[A-Za-z0-9_]*|GIT_CONFIG_[A-Za-z0-9_]*|COMPACT_ADVISER_DISABLE|LAVISH_AXI_HOST|CLAUDE_CONFIG_DIR|CLAUDE_CODE_[A-Za-z0-9_]*|DISABLE_AUTOUPDATER|CLAUDECODE)$'
-    printf 'unset fcr_v\n'
+    if [ "$scope" = full ]; then
+      printf 'fcr_keep=%q\n' " $(printf '%s' "$withheld" | jq -r 'join(" ")') "
+      # shellcheck disable=SC2016 # Expanded by the launcher, not here.
+      printf '%s\n' 'while IFS= read -r fcr_v; do
+  case "$fcr_v" in HERDR_* | PWD | OLDPWD | SHLVL | _ | SHELLOPTS | BASHOPTS | fcr_*) continue ;; esac
+  case "$fcr_keep" in *" $fcr_v "*) continue ;; esac
+  unset "$fcr_v"
+done < <(compgen -e)
+unset fcr_v fcr_keep'
+    else
+      # shellcheck disable=SC2016 # Expanded by the launcher, not here.
+      printf 'while IFS= read -r fcr_v; do unset "$fcr_v"; done < <(compgen -e | grep -E %q)\n' \
+        '^(FM_[A-Za-z0-9_]*|GIT_CONFIG_[A-Za-z0-9_]*|COMPACT_ADVISER_DISABLE|LAVISH_AXI_HOST|CLAUDE_CONFIG_DIR|CLAUDE_CODE_[A-Za-z0-9_]*|DISABLE_AUTOUPDATER|CLAUDECODE)$'
+      printf 'unset fcr_v\n'
+    fi
     printf '%s' "$env_json" | jq -r 'to_entries[] | "export \(.key)=\(.value | @sh)"'
     printf 'exec %s\n' "$(fcr_shell_join "$@")"
   } >"$tmp" && chmod 700 "$tmp" && mv -f "$tmp" "$file" && return 0
@@ -904,7 +920,8 @@ fcr_resume() {
 
     mkdir -p "$launch_dir" 2>/dev/null && chmod 700 "$launch_dir" 2>/dev/null
     launcher="$launch_dir/$(printf '%s' "$home" | cksum | cut -d' ' -f1)-${label//\//--}.sh"
-    if ! fcr_write_launcher "$launcher" "$cwd" "$(printf '%s' "$rec" | jq -c '.env // {}')" "${newargv[@]}"; then
+    if ! fcr_write_launcher "$launcher" "$cwd" "$(printf '%s' "$rec" | jq -c '.env // {}')" \
+      "$(printf '%s' "$rec" | jq -r '.env_scope // "allowlist"')" "$(printf '%s' "$rec" | jq -c '.env_withheld // []')" "${newargv[@]}"; then
       fcr_say failed "$label" "could not write launcher $launcher"
       failed=$((failed + 1)); continue
     fi

@@ -42,8 +42,20 @@
 #            stop_sequence), "[Request interrupted by user...]", the output of
 #            a local slash command, or no conversation at all
 #   unknown  no transcript path recorded, or the transcript cannot be read
-# An idle or unknown session is resumed without a note: it comes back exactly
-# where it stopped and waits, since a session that was set moving cannot be
+# An idle session that was waiting on a background job of its own also gets the
+# note, because the restart killed that job and the session would otherwise wait
+# for a notification that never comes. From the same transcript, a job counts as
+# running when its start is recorded after the session's last startup or resume
+# (a restart killed whatever ran before) and no notification with a final status
+# (completed, failed, killed, stopped) or TaskStop result names it afterwards:
+#   Bash         a command run in the background, or moved there by its timeout
+#   Monitor      a monitor started on a stream (its "Monitor event" notifications
+#                do not end it)
+#   Agent        a subagent launched asynchronously
+# A session whose last entry is an interruption by the user is not counted as
+# waiting: the person stopped it on purpose. A plain idle session, with no job
+# running, and an unknown one are resumed without a note: they come back exactly
+# where they stopped and wait, since a session that was set moving cannot be
 # stopped after the fact, while a quiet one can be prompted at any time.
 # --no-prompt sends no note to any session; --prompt sends it to every one.
 #
@@ -65,7 +77,8 @@
 #   --no-prompt      resume with no restart note, even a session that was
 #                    working: it comes back and waits (combine with --only)
 #   --prompt         send the restart note to every resumed session, even one
-#                    that was idle or whose state is unknown
+#                    that was idle (with no background job) or whose state is
+#                    unknown
 #   --close-blank    then close blank panes nothing uses (see above); with
 #                    --dry-run, list the panes it would close
 #
@@ -243,18 +256,64 @@ FCR_TURN_JQ='
     elif .type == "assistant" then
       if .isApiErrorMessage != true and (.message.stop_reason == "end_turn" or .message.stop_reason == "stop_sequence")
       then "idle" else "working" end
-    elif any(texts[]; contains("[Request interrupted by user")) then "idle"
+    elif any(texts[]; contains("[Request interrupted by user")) then "interrupted"
     elif any(texts[]; startswith("<local-command-stdout>") or startswith("<local-command-stderr>")) then "idle"
     else "working" end'
 
-# fcr_turn_state <transcript>: print working, idle or unknown - whether the
-# session was mid-turn when it stopped.
+# fcr_turn_state <transcript>: print working, idle, interrupted (idle, after the
+# user interrupted it) or unknown - whether the session was mid-turn when it
+# stopped.
 fcr_turn_state() {
   local st=''
   if [ -n "$1" ] && [ -f "$1" ] && [ -r "$1" ]; then
     st=$(tac -- "$1" 2>/dev/null | jq -nrR "$FCR_TURN_JQ" 2>/dev/null)
   fi
-  case "$st" in idle | working) printf '%s' "$st" ;; *) printf 'unknown' ;; esac
+  case "$st" in idle | interrupted | working) printf '%s' "$st" ;; *) printf 'unknown' ;; esac
+}
+
+# The jq program behind fcr_background_jobs. Reads the transcript oldest first
+# and keeps the background jobs started since the last startup or resume hook
+# and not yet reported finished; see "Restart note" above. Sidechain (subagent)
+# entries never start a job of the main session.
+# shellcheck disable=SC2016 # A jq program, not shell.
+FCR_JOBS_JQ='
+  def finished_ids:
+    (if .type == "queue-operation" and .operation == "enqueue" then [.content]
+     elif .attachment.type? == "queued_command" then [.attachment.prompt]
+     elif .type == "user" and .origin.kind? == "task-notification"
+       then [.message.content | if type == "string" then . elif type == "array" then (.[] | objects | .text) else empty end]
+     else [] end)
+    | map(strings | match("<task-notification>([\\s\\S]*?)</task-notification>"; "g").captures[0].string
+          | select(test("<status>[a-z_-]+</status>"))
+          | capture("<task-id>(?<id>[^<]+)</task-id>").id)
+    | .[];
+  def started_ids:
+    if .type == "user" and .isSidechain != true and (.toolUseResult | type) == "object" then
+      .toolUseResult as $r
+      | [$r.backgroundTaskId?,
+         (if $r | has("persistent") then $r.taskId? else empty end),
+         (if $r.status? == "async_launched" then $r.agentId? else empty end)]
+        | map(strings) | .[]
+    else empty end;
+  reduce (inputs | fromjson? | objects) as $e ({};
+    if $e.type == "attachment" and $e.attachment.type? == "hook_success"
+       and (($e.attachment.hookName? // "") | test("^SessionStart:(startup|resume)$")) then {}
+    else
+      reduce ($e | finished_ids) as $id (.; del(.[$id]))
+      | reduce (($e.toolUseResult? | objects | .task_id? | strings), empty) as $id (.; del(.[$id]))
+      | reduce ($e | started_ids) as $id (.; .[$id] = true)
+    end)
+  | length'
+
+# fcr_background_jobs <transcript>: print how many background jobs the session
+# had running when it stopped (0 when none, or when the transcript is unreadable).
+fcr_background_jobs() {
+  local n=''
+  if [ -n "$1" ] && [ -f "$1" ] && [ -r "$1" ]; then
+    n=$(jq -nrR "$FCR_JOBS_JQ" <"$1" 2>/dev/null)
+  fi
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
 }
 
 # --- liveness ----------------------------------------------------------------
@@ -629,7 +688,7 @@ fcr_resume() {
   fi
 
   local n=${#T_LABEL[@]} i label kind meta record inbox rec sid cwd transcript session
-  local pid lock reason ws tab pane state place newws newtab newpane out note launcher turn noted
+  local pid lock reason ws tab pane state place newws newtab newpane out note launcher turn noted jobs
   local launch_dir failed=0 resumed=0 alive=0 skipped=0 matched=0
   local -a plan_idx=() sessions=() argv=() newargv=() blank_sessions=()
   launch_dir=${FCR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/firstmate-claude-resume}/launch
@@ -750,17 +809,27 @@ fcr_resume() {
       alive=$((alive + 1)); continue
     fi
 
-    # The restart note goes only to a session that was working (or to all
-    # with --prompt, none with --no-prompt); see "Restart note" above.
+    # The restart note goes only to a session that was working or waiting on its
+    # own background job (or to all with --prompt, none with --no-prompt); see
+    # "Restart note" above.
     note=''
     case "$prompt" in
       always) noted='restart note (--prompt)' ;;
       never) noted='no restart note (--no-prompt)' ;;
       *)
-        turn=$(fcr_turn_state "$(printf '%s' "$rec" | jq -r '.transcript_path // empty')")
+        transcript=$(printf '%s' "$rec" | jq -r '.transcript_path // empty')
+        turn=$(fcr_turn_state "$transcript")
         case "$turn" in
           working) noted='restart note (was working)' ;;
-          idle) noted='no restart note (was idle)' ;;
+          idle)
+            jobs=$(fcr_background_jobs "$transcript")
+            if [ "$jobs" -gt 0 ]; then
+              noted="restart note (was idle, waiting on $jobs background job$([ "$jobs" = 1 ] || echo s))"
+            else
+              noted='no restart note (was idle)'
+            fi
+            ;;
+          interrupted) noted='no restart note (was idle)' ;;
           *) noted='no restart note (turn state unknown)' ;;
         esac
         ;;
